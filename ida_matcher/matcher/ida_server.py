@@ -40,6 +40,7 @@ def load_or_reload_logic():
 
 def handle_client(conn):
     try:
+        conn.settimeout(0.5)
         load_or_reload_logic()
         data = conn.recv(4096).decode('utf-8', errors='ignore')
         if not data:
@@ -58,8 +59,8 @@ def handle_client(conn):
         
         if method == "GET":
             parsed = urlparse(path)
+            qs = parse_qs(parsed.query)
             if parsed.path == '/func':
-                qs = parse_qs(parsed.query)
                 name = qs.get('name', [None])[0]
                 
                 response_data = None
@@ -74,6 +75,23 @@ def handle_client(conn):
                     response = f"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}"
                 
                 conn.settimeout(None) 
+                conn.sendall(response.encode('utf-8'))
+            elif parsed.path == '/funcs':
+                # Batch lookup: GET /funcs?names=a,b,c
+                names_raw = qs.get('names', [''])[0]
+                name_list = [n for n in names_raw.split(',') if n]
+                results = {}
+                if LOGIC_MODULE:
+                    for n in name_list:
+                        results[n] = LOGIC_MODULE.get_function_bytes(n)
+                body = json.dumps({"results": results})
+                response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}"
+                conn.settimeout(None)
+                conn.sendall(response.encode('utf-8'))
+            elif parsed.path == '/health':
+                body = '{"status": "ok"}'
+                response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}"
+                conn.settimeout(None)
                 conn.sendall(response.encode('utf-8'))
             elif parsed.path == '/refresh':
                 if LOGIC_MODULE:
@@ -110,9 +128,18 @@ def timer_callback():
         if r:
             conn, addr = SERVER_SOCKET.accept()
             conn.settimeout(0.5) 
-            handle_client(conn)
+            try:
+                handle_client(conn)
+            except Exception:
+                print("IDA Live Matcher: connection handler error:")
+                traceback.print_exc()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     except Exception:
-        pass
+        print("IDA Live Matcher: timer error:")
+        traceback.print_exc()
         
     return 100
 

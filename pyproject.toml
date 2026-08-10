@@ -1,0 +1,14 @@
+[project]
+name = "ida_matcher"
+version = "0.1.0"
+description = "IDA Pro live binary matching and diffing tool"
+requires-python = ">=3.9"
+dependencies = ["capstone"]
+
+[project.scripts]
+ida-match = "ida_matcher.matcher.run_match:main"
+ida-watch  = "ida_matcher.matcher.watch:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ida_matcher*"]
