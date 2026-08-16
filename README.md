@@ -108,8 +108,16 @@ ida-match path/to/compiled.obj --json
 {
   "obj": "compiled.obj",
   "connected": true,
+  "summary": {
+    "match": 2,
+    "match_100": 1,
+    "match_below": 1,
+    "thunk": 1,
+    "not_found": 1
+  },
   "functions": [
     {"name": "?Foo@@YAXXZ", "status": "match", "match_pct": 100.0, "count": 23},
+    {"name": "?Bar@@YAXH@Z", "status": "match", "match_pct": 92.9, "count": 56},
     {"name": "?Baz@@YAXXZ", "status": "thunk",  "match_pct": null,  "count": null},
     {"name": "?Renamed@@YAXXZ", "status": "not_found", "match_pct": null, "count": null}
   ]
@@ -133,6 +141,7 @@ The watcher keeps running even if a match fails (e.g. server momentarily down). 
 |---|---|---|
 | `--func <mangled>` | `ida-match`, `ida-watch` | Diff a single function instead of the summary |
 | `--json` | `ida-match` | Machine-readable JSON summary (summary mode only) |
+| `--strict` | `ida-match` | Exit code 1 when any recognized function scores below 100% (CI gate) |
 | `--no-color` | both | Disable ANSI colors (also honours the `NO_COLOR` env var) |
 
 ## How it works
@@ -140,7 +149,7 @@ The watcher keeps running even if a match fails (e.g. server momentarily down). 
 1. **COFF parsing (client)** — `coff_parser.py` parses the compiler header, section headers, symbols, and relocations of the `.obj` directly (pure `struct`). For every function-like symbol it records the raw bytes, the relocation offsets (with their 2- or 4-byte widths), and the reloc target symbol names.
 2. **HTTP lookup (client → IDA)** — the client asks the server for each function it found: `GET /funcs?names=a,b,c` (batch) or `GET /func?name=…` (single). The server answers with bytes, IDA fixup offsets, and jump-table info.
 3. **IDA-side extraction** — `ida_logic.py` walks each function chunk with `ida_ua.decode_insn` and the IDA fixup table to locate absolute-address bytes, and pulls switch/jump-table targets, so both sides describe the code the same way.
-4. **Comparison** — bytes that belong to a relocation/fixup on both sides are compared symbolically (normalized names, `__imp_`/`j_`/`_` prefixes stripped); if both sides know the target it is treated as a match only when the symbols agree. Concrete bytes are compared directly, and any length difference lowers the score.
+4. **Comparison** — bytes that belong to a relocation/fixup on both sides are compared symbolically (normalized names, `__imp_`/`j_`/`_` prefixes stripped); if both sides know the target it is treated as a match only when the symbols agree. Concrete bytes are compared directly. The summary first aligns both byte streams via `difflib` (LCS), so an inserted NOP drops the score slightly instead of shifting every later byte to 0%. Base jump tables (`.rdata` switch tables appended to the function) are stripped out before scoring since the `.obj` never contains them.
 5. **Diff rendering** — Capstone disassembles both byte streams; `difflib` aligns them and the mismatched instructions are highlighted inline.
 
 ## Project layout

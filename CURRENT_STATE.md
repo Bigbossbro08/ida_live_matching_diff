@@ -82,26 +82,29 @@ Function record: `{ea, size, bytes(hex), is_thunk, switches{off:[offsets]}, fixu
 | I11 | Watch loop no longer dies when a run fails (`SystemExit` swallowed → keeps watching). | Done (this session) |
 | I12 | `load_obj` returns `{}` for a missing/unreadable file instead of raising. | Done (this session) |
 | I13 | Automated **pytest** suite added: `tests/test_coff_parser.py` + `tests/test_match_core.py` (28 tests, headless). | Done (this session) |
+| I14 | **LCS-based summary resync**: `compare_functions` now aligns via `difflib.SequenceMatcher` before scoring, so an inserted NOP/`int3` drops the score slightly (~95%) instead of decimating it to 0% via offset shift. Reloc semantics (`_reloc_symbols_match`) reapplied per aligned pair. | Done (this session) |
+| I15 | **`--strict` CI gate**: exit code 1 when any recognized function is below 100%; summary tracks `match_100`/`match_below` and the JSON output gains a `summary` object. | Done (this session) |
+| I16 | **Switch tables excluded from scoring**: `ida_logic` reports each jump table's byte range (`switch_ranges`); the client strips those `.rdata` bytes (and remaps base fixups) so base-only table bytes no longer penalize the match. | Done (this session) |
 
 ## 4. Verification performed
 
 - `python -m py_compile` clean across all 9 `.py` files.
-- `python -m pytest ida_matcher/matcher/tests -q` → **28 passed**:
+- `python -m pytest ida_matcher/matcher/tests -q` → **34 passed**:
   - coff_parser: function extraction, reloc resolution, per-reloc widths, missing file.
-  - match_core: identical/different/length-mismatch, reloc-symbol logic (same/diff/anon/compat), instruction normalization (token replace, comment append, jump-relative), name normalization (`__imp_`, `j_`), batch fetch + fallback, JSON summary output.
+  - match_core: identical/different/length-mismatch, reloc-symbol logic (same/diff/anon/compat), LCS resync (leading/mid insertion), switch-range stripping + clamping, instruction normalization (token replace, comment append, jump-relative), name normalization (`__imp_`, `j_`), batch fetch + fallback, JSON summary output + metrics, `--strict` exit codes.
 - Headless CLI smoke: `ida-match synth.obj` (server down) prints the friendly connectivity message.
 
 ### Not verified in this environment (needs a real IDA/session)
 - `ida_server.py` routes (`/func`, `/funcs`, `/health`, `/refresh`) — compile-checked only.
-- `ida_logic.py` extraction paths (operands vs fixups, switch tables, thunks) — unchanged this session except documented F4/F5 behavior.
+- `ida_logic.py` extraction paths (operands vs fixups, switch tables, thunks) — compile-checked only; the new `switch_ranges` field and F4/F5 behavior need a live IDA session to verify end-to-end.
 - End-to-end match against a real binary.
 
 ## 5. Known limitations / current design decisions
 
-1. **Strict byte summary** (I7): % is exact byte-overlap; an inserted `int3`/NOP anywhere drops the score. Viewing is meant for `--func`.
+1. **Summary % is LCS-aligned** (I14): inserted/deleted bytes resync and only drop the score by their own length, so a single leading NOP reads ~95%+, not 0%. True byte-level drift is still a strong signal.
 2. **One-side-reloc bytes always `match`** when the other side is concrete (reloc vs. fixed value is treated as “not comparable”, not a diff). Two-sided relocation bytes compare by symbol identity.
 3. **Thunks are skipped**, not diffed; real tiny tail-call functions are *not* treated as thunks (guarded by `size ≤ 16` + single `jmp mem`).
-4. **Switches are informational** — base jump-table targets are printed but not compared against the `.obj` (COFF relocs don’t carry switch metadata easily).
+4. **Switches are informational + range-stripped** — base jump-table targets are printed but not compared against the `.obj` (COFF relocs don’t carry switch metadata easily); the table’s `.rdata` byte range (`switch_ranges`) is stripped from the base before scoring so it doesn’t penalize the match. Server-side range extraction is compile-checked only (needs live IDA to verify).
 5. **Orthogonality**: `compare_functions` masks reloc bytes by width; IDA-side fixups assume width 4 (x86-32 abs addresses) — a corner case for 8-bit/16-bit displaced operands could over-mask, but x86-32 absolute operands are 4 bytes.
 6. **Match scope** is exact-mangled-name → rename functions in IDA and they’ll report “not found”.
 7. **One connection per 100 ms IDA timer tick** — this was the N-round-trip pain for big `.obj` files; `/funcs` batch removes it for summary runs.
@@ -109,8 +112,8 @@ Function record: `{ea, size, bytes(hex), is_thunk, switches{off:[offsets]}, fixu
 ## 6. What can be improved next (prioritized)
 
 ### High impact / low risk (can be done headless)
-1. **Instruction-level summary resync** — raise the summary % by aligning via LCS before scoring (keeps “insert byte” signal but avoids 0% for a single leading NOP). Currently decision I7 is strict; re-exposing as `--lenient` would cover both.
-2. **CLI exit code for CI**: exit non-zero when any known function < 100% (or add `--strict`); lets build pipelines gate on recompilation drift.
+1. ~~**Instruction-level summary resync**~~ — **Done** (I14): summary % is now LCS-aligned via `difflib` while keeping the “insert byte” signal; strict byte-exact behavior can be re-exposed as `--strict-byte` if ever wanted.
+2. ~~**CLI exit code for CI**~~ — **Done** (I15): `--strict` exits non-zero when any recognized function is below 100%; lets build pipelines gate on recompilation drift.
 3. **Digest caching in `ida-watch`**: store the last `.obj` hash and skip unchanged rebuilds more cheaply (already cheap), and only re-request funcs whose bytes changed (server-side last-write tracking).
 4. **More unit tests**: jump-table/tail-call fixtures for `diff_function` using Capstone (installed) — cover `[RELOC≠]` print path and switch block.
 
@@ -133,6 +136,7 @@ pip install -e .                    # installs ida-match / ida-watch
 # In IDA console: exec ida_matcher/matcher/ida_server.py   (port 28000)
 
 ida-match path/to/file.obj                          # summary
+ida-match path/to/file.obj --strict                 # exit 1 if any match < 100% (CI)
 ida-match path/to/file.obj --func "?foo@@YAXXZ"      # side-by-side diff
 ida-match path/to/file.obj --json | python -m json.tool
 ida-watch path/to/file.obj [--func ?foo@@YAXXZ]     # rerun on rebuild
@@ -141,5 +145,5 @@ ida-watch path/to/file.obj [--func ?foo@@YAXXZ]     # rerun on rebuild
 ### Test suite
 
 ```bash
-python -m pytest ida_matcher/matcher/tests -q      # 28 tests, offline
+python -m pytest ida_matcher/matcher/tests -q      # 34 tests, offline
 ```

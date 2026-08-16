@@ -189,8 +189,10 @@ def load_obj(obj_path: Path) -> Dict[str, Dict]:
             if s and s["section"] > 0:
                 sec = sections[s["section"] - 1]
                 # Only keep function-like symbols (derived type nibble: 0=none, 2=function).
+                # Ignore internal MSVC labels (e.g. $L jump tables) which artificially truncate functions.
                 if (sec["flags"] & 0x00000020) and (s["type"] & 0x00F0) in (0x00, IMAGE_SYM_TYPE_FUNCTION):
-                    code_syms.append(s)
+                    if not s["name"].startswith("$"):
+                        code_syms.append(s)
                 
         sec_to_syms = {}
         for s in code_syms:

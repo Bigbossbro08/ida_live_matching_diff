@@ -40,7 +40,8 @@ def _configure_colors(enabled):
 # masks the bytes it covers so absolute addresses don't cause false mismatches.
 DEFAULT_RELOC_WIDTH = 4
 
-_ANON_SYM_RE = re.compile(r'^(?:sub|unk|loc|off|byte|word|dword|qword|asc)_[0-9a-fA-F_]+$')
+_ANON_SYM_RE = re.compile(r'^(?:sub|unk|loc|off|byte|word|dword|qword|asc|jpt|def)_[0-9a-fA-F_]+$')
+_MSVC_LOCAL_LABEL_RE = re.compile(r'^\$L_?\d+$')
 
 def _reloc_byte_map(relocs, widths=None, default=DEFAULT_RELOC_WIDTH):
     """Flatten {reloc_offset: name} (+ optional per-reloc widths) into {byte_index: name}."""
@@ -63,6 +64,8 @@ def _looks_anonymous(name):
     """Address-derived labels (sub_401000, unk_402000, ...) carry no symbol identity."""
     n = str(name).lstrip('@?')
     if _ANON_SYM_RE.match(n):
+        return True
+    if _MSVC_LOCAL_LABEL_RE.match(n):
         return True
     if n.startswith('0x'):
         return True
@@ -90,13 +93,51 @@ def _sym_ref_in_line(line):
     m = re.search(r'<([^>]+)>', line)
     return m.group(1) if m else None
 
-def compare_functions(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, obj_reloc_widths=None):
+def _strip_switch_ranges(data_bytes, fixups, switch_ranges, reloc_widths=None):
+    """Drop jump-table (.rdata) byte ranges so they don't penalize the
+    match. Fixup offsets are remapped onto the stripped buffer.
+    """
+    if not switch_ranges:
+        if reloc_widths is not None:
+            return data_bytes, fixups, reloc_widths
+        return data_bytes, fixups
+
+    drop = [False] * len(data_bytes)
+    for start, end in switch_ranges:
+        for i in range(max(0, start), min(end, len(data_bytes))):
+            drop[i] = True
+
+    new_bytes = bytearray()
+    new_fixups = {}
+    new_widths = {}
+    removed = 0
+    for i, b in enumerate(data_bytes):
+        if drop[i]:
+            removed += 1
+            continue
+        new_bytes.append(b)
+        if i in fixups:
+            new_fixups[i - removed] = fixups[i]
+        if reloc_widths is not None and i in reloc_widths:
+            new_widths[i - removed] = reloc_widths[i]
+
+    if reloc_widths is not None:
+        return new_bytes, new_fixups, new_widths
+    return new_bytes, new_fixups
+
+def compare_functions(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, obj_reloc_widths=None, base_switch_ranges=None):
     base_bytes_hex = re.sub(r'[^0-9a-fA-F]', '', base_bytes_hex)
     if len(base_bytes_hex) % 2 != 0:
         base_bytes_hex = base_bytes_hex[:-1]
 
     base_bytes = bytearray.fromhex(base_bytes_hex)
     obj_bytes = bytearray(obj_bytes)
+
+    if base_switch_ranges:
+        base_bytes, base_fixups = _strip_switch_ranges(base_bytes, base_fixups, base_switch_ranges)
+        obj_bytes, obj_relocs, obj_reloc_widths = _strip_switch_ranges(
+            obj_bytes, obj_relocs, base_switch_ranges, obj_reloc_widths or {}
+        )
 
     while obj_bytes and obj_bytes[-1] in (0x90, 0xCC):
         obj_bytes.pop()
@@ -110,23 +151,36 @@ def compare_functions(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, obj_re
     if total_count == 0:
         return 0.0, 0
 
+    # LCS alignment via difflib: inserted/deleted bytes resync instead of
+    # shifting every later byte out of phase (one leading NOP no longer
+    # decimates the score). SequenceMatcher needs a *transitive* token space,
+    # so we first align on (kind, value) tokens -- concrete bytes by value, any
+    # relocated byte (own reloc OR other-side fixup window) as one reloc token.
+    def align_tokens(data, reloc_map, other_reloc_map):
+        return [
+            ("r", 0) if (reloc_map.get(i) is not None or other_reloc_map.get(i) is not None) else ("b", data[i])
+            for i in range(len(data))
+        ]
+
+    obj_tokens = align_tokens(obj_bytes, obj_reloc_map, base_fixup_map)
+    base_tokens = align_tokens(base_bytes, base_fixup_map, obj_reloc_map)
+
+    # Second pass: re-apply the exact per-byte semantics on the aligned pairs.
+    # * both relocated -> match iff _reloc_symbols_match (symbols align)
+    # * one side relocated, other concrete -> not comparable -> match
+    # * both concrete -> match iff byte-equal
     match_count = 0
-    for i in range(total_count):
-        if i >= len(obj_bytes) or i >= len(base_bytes):
-            continue
-
-        o_sym = obj_reloc_map.get(i)
-        b_sym = base_fixup_map.get(i)
-
-        if o_sym is not None and b_sym is not None:
-            # Shadowed on both sides: compare the relocated targets.
-            if _reloc_symbols_match(o_sym, b_sym):
+    for i, j, size in difflib.SequenceMatcher(None, obj_tokens, base_tokens, autojunk=False).get_matching_blocks():
+        for k in range(size):
+            o_sym = obj_reloc_map.get(i + k)
+            b_sym = base_fixup_map.get(j + k)
+            if o_sym is not None and b_sym is not None:
+                if _reloc_symbols_match(o_sym, b_sym):
+                    match_count += 1
+            elif o_sym is not None or b_sym is not None:
                 match_count += 1
-        elif o_sym is not None or b_sym is not None:
-            # Relocated on one side only (other side concrete) => not comparable.
-            match_count += 1
-        elif obj_bytes[i] == base_bytes[i]:
-            match_count += 1
+            elif obj_bytes[i + k] == base_bytes[j + k]:
+                match_count += 1
 
     return (match_count / total_count) * 100, total_count
 
@@ -283,7 +337,7 @@ def print_hexdump_diff(obj_bytes, base_bytes, obj_relocs, base_fixups, obj_reloc
                 
         print(f"{b_str} | {o_str}")
 
-def diff_function(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, base_switches=None, obj_reloc_widths=None):
+def diff_function(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, base_switches=None, obj_reloc_widths=None, base_switch_ranges=None):
     if not HAS_CAPSTONE:
         print(f"{RED}Error: capstone module not installed. Run: pip install capstone{RESET}")
         return 0.0
@@ -293,6 +347,12 @@ def diff_function(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, base_switc
         base_bytes_hex = base_bytes_hex[:-1]
     base_bytes = bytearray.fromhex(base_bytes_hex)
     obj_bytes = bytearray(obj_bytes)
+
+    if base_switch_ranges:
+        base_bytes, base_fixups = _strip_switch_ranges(base_bytes, base_fixups, base_switch_ranges)
+        obj_bytes, obj_relocs, obj_reloc_widths = _strip_switch_ranges(
+            obj_bytes, obj_relocs, base_switch_ranges, obj_reloc_widths or {}
+        )
 
     while obj_bytes and obj_bytes[-1] in (0x90, 0xCC):
         obj_bytes.pop()
@@ -341,12 +401,16 @@ def diff_function(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, base_switc
                 if b_has_reloc or o_has_reloc:
                     b_sym = _sym_ref_in_line(base_lines[bi])
                     o_sym = _sym_ref_in_line(obj_lines[oi])
+                    tag_str = ""
+                    w = max(0, COL_W - len(tag_str))
                     if b_sym and o_sym and not _reloc_symbols_match(b_sym, o_sym):
-                        tag_str = f" [RELOC≠ {b_sym} != {o_sym}]"
-                        print(f"{RED}{base_lines[bi]:<{COL_W}} | {obj_lines[oi]:<{COL_W - len(tag_str)}}{tag_str}{RESET}")
+                        tag_str = f" [RELOC!= {b_sym} != {o_sym}]"
+                        w = max(0, COL_W - len(tag_str))
+                        print(f"{RED}{base_lines[bi]:<{COL_W}} | {obj_lines[oi]:<{w}}{tag_str}{RESET}")
                     else:
                         tag_str = " [RELOC]"
-                        print(f"{YELLOW}{base_lines[bi]:<{COL_W}} | {obj_lines[oi]:<{COL_W - len(tag_str)}}{tag_str}{RESET}")
+                        w = max(0, COL_W - len(tag_str))
+                        print(f"{YELLOW}{base_lines[bi]:<{COL_W}} | {obj_lines[oi]:<{w}}{tag_str}{RESET}")
                         match_count += 1
                 else:
                     b_hl, o_hl = highlight_diff_inline(base_lines[bi], obj_lines[oi])
@@ -394,13 +458,19 @@ def refresh_ida_cache():
     except Exception:
         pass
 
-def match_summary(obj_path: Path, json_out: bool = False) -> None:
+def match_summary(obj_path: Path, json_out: bool = False, strict: bool = False) -> int:
+    """Run a summary match against the live IDA server.
+
+    Returns an exit code: 0 on success, 1 when `strict` is set and any
+    recognized function scored below 100% (CI gate). Server-down / empty obj
+    keep returning 0 for backward compatibility.
+    """
     refresh_ida_cache()
     obj_funcs = load_obj(obj_path)
 
     if not obj_funcs:
         print("No functions found in the .obj file.")
-        return
+        return 0
 
     if not server_alive():
         msg = (
@@ -411,7 +481,7 @@ def match_summary(obj_path: Path, json_out: bool = False) -> None:
             print(json.dumps({"obj": str(obj_path), "connected": False}))
         else:
             print(msg)
-        return
+        return 0
 
     records = fetch_many_from_ida(list(obj_funcs))
     if records is None:
@@ -431,29 +501,41 @@ def match_summary(obj_path: Path, json_out: bool = False) -> None:
             pct, count = compare_functions(
                 func_data["bytes"], base_match["bytes"], func_data["relocs"],
                 base_fixups, func_data.get("reloc_widths", {}),
+                base_match.get("switch_ranges", []),
             )
             row.update(status="match", match_pct=pct, count=count)
         rows.append(row)
 
+    matched_100 = sum(1 for r in rows if r["status"] == "match" and r["match_pct"] == 100.0)
+    matched_below = sum(1 for r in rows if r["status"] == "match" and r["match_pct"] < 100.0)
+    summary = {
+        "match": matched_100 + matched_below,
+        "match_100": matched_100,
+        "match_below": matched_below,
+        "thunk": sum(1 for r in rows if r["status"] == "thunk"),
+        "not_found": sum(1 for r in rows if r["status"] == "not_found"),
+    }
+
     if json_out:
-        print(json.dumps({"obj": str(obj_path), "connected": True, "functions": rows}, indent=2))
-        return
+        print(json.dumps({"obj": str(obj_path), "connected": True, "summary": summary, "functions": rows}, indent=2))
+        return 1 if (strict and matched_below) else 0
 
     print("\n" + "=" * 50 + "\nMATCHING RESULTS\n" + "=" * 50)
-    summary = {"match": 0, "thunk": 0, "not_found": 0}
     for row in rows:
         if row["status"] == "not_found":
             print(f"{DIM}[????] {row['name']} (Not found in Live IDA Database){RESET}")
-            summary["not_found"] += 1
         elif row["status"] == "thunk":
             print(f"{DIM}[THNK] {row['name']} (IDA thunk/forwarder - skipped){RESET}")
-            summary["thunk"] += 1
         else:
             pct = row["match_pct"]
             color = GREEN if pct == 100.0 else (YELLOW if pct >= 80.0 else RED)
             print(f"{color}[{pct:>6.2f}%]{RESET} {row['name']} ({row['count']} bytes)")
-            summary["match"] += 1
     print(f"{DIM}{summary}{RESET}")
+
+    if strict and matched_below:
+        print(f"{RED}Strict mode: {matched_below} function(s) below 100% match.{RESET}")
+        return 1
+    return 0
 
 def match_focus(obj_path: Path, func_name: str) -> None:
     refresh_ida_cache()
@@ -486,7 +568,8 @@ def match_focus(obj_path: Path, func_name: str) -> None:
     print(f"\n{'=' * 50}\nDIFF: {func_name}\n{'=' * 50}")
 
     base_switches = base_match.get("switches", {})
-    diff_function(obj_bytes, base_match["bytes"], obj_relocs, base_fixups, base_switches, obj_reloc_widths)
+    base_switch_ranges = base_match.get("switch_ranges", [])
+    diff_function(obj_bytes, base_match["bytes"], obj_relocs, base_fixups, base_switches, obj_reloc_widths, base_switch_ranges)
 
 def main():
     import argparse
@@ -496,6 +579,7 @@ def main():
     parser.add_argument("obj_path", help="Path to the .obj file")
     parser.add_argument("--func", help="Target a single function for side-by-side diff (mangled name)")
     parser.add_argument("--json", action="store_true", help="Emit a machine-readable JSON summary (summary mode only)")
+    parser.add_argument("--strict", action="store_true", help="Exit 1 when any recognized function is below 100%% (CI gate)")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors (also honors NO_COLOR env)")
     args = parser.parse_args()
 
@@ -504,8 +588,9 @@ def main():
 
     if args.func:
         match_focus(Path(args.obj_path), args.func)
+        sys.exit(0)
     else:
-        match_summary(Path(args.obj_path), json_out=args.json)
+        sys.exit(match_summary(Path(args.obj_path), json_out=args.json, strict=args.strict))
 
 if __name__ == "__main__":
     main()

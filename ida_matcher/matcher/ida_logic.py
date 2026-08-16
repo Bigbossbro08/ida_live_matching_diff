@@ -149,6 +149,7 @@ def get_function_bytes(name):
             "size": func.size(),
             "bytes": "",
             "switches": {},
+            "switch_ranges": [],
             "fixups": {},
         }
 
@@ -160,6 +161,7 @@ def get_function_bytes(name):
     relocs.update(_get_func_relocs_via_fixups(func, chunks))
 
     switch_tables = {}
+    switch_ranges = []
     for head in idautils.FuncItems(func.start_ea):
         si = ida_nalt.switch_info_t()
         if ida_nalt.get_switch_info(si, head):
@@ -168,6 +170,12 @@ def get_function_bytes(name):
             j_elemsize = si.get_jtable_element_size()
             targets = []
             if j_size > 0 and j_elemsize > 0:
+                # The jump table lives in .rdata and is appended to the function
+                # chunks; the .obj never contains it, so record its byte range
+                # (function-relative) for the client to strip from the diff.
+                table_start = jtable_ea - func.start_ea
+                if table_start >= 0:
+                    switch_ranges.append([table_start, table_start + j_size * j_elemsize])
                 # Entries are either absolute VAs or offsets relative to the table
                 # base when the SWI_ELBASE flag is set.
                 elbase = bool(si.flags & getattr(ida_nalt, "SWI_ELBASE", 0))
@@ -188,6 +196,7 @@ def get_function_bytes(name):
         "size": len(all_bytes),
         "bytes": all_bytes.hex(),
         "switches": switch_tables,
+        "switch_ranges": switch_ranges,
         "fixups": {str(k): v for k, v in relocs.items()},
     }
 

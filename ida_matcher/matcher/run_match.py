@@ -22,6 +22,7 @@ def main():
     parser.add_argument("obj_file", help="Path to the .obj file")
     parser.add_argument("--func", help="Focus on a specific function (mangled name)")
     parser.add_argument("--json", action="store_true", help="Emit a machine-readable JSON summary")
+    parser.add_argument("--strict", action="store_true", help="Exit 1 when any recognized function is below 100%% (CI gate)")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     args = parser.parse_args()
 
@@ -36,7 +37,7 @@ def main():
     if args.func:
         match_focus(obj_path, args.func)
     else:
-        match_summary(obj_path, json_out=args.json)
+        sys.exit(match_summary(obj_path, json_out=args.json, strict=args.strict))
 
 
 if __name__ == "__main__":
