@@ -1,0 +1,3 @@
+[submodule "vendor/objdiff"]
+	path = vendor/objdiff
+	url = https://github.com/encounter/objdiff
