@@ -9,6 +9,16 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .venv/
-venv//vendor/objdiff-py/target/
-/vendor/objdiff/target/
+venv/
+
+# Rust/Cargo targets
+vendor/objdiff-py/target/
+vendor/objdiff/target/
+
+# Temp / test files
 synth.*
+
+# Ignore all markdown files (planning, tracking) except README
+*.md
+*.MD
+!README.md
