@@ -16,19 +16,41 @@ A live binary matching and diffing tool. It compares **MSVC-compiled `.obj` file
 - **Live matching** — query the open IDA database in real time via a small HTTP server plugin; no baseline export step.
 - **Side-by-side diff** — per-function view with a Capstone instruction diff and a 16-byte aligned hex dump.
 - **Relocation-aware comparison** — relocations are parsed straight from the `.obj` and matched against IDA fixups, so different virtual addresses (or changed call targets like `printf` → `puts`) do not produce false matches.
-- **No external tooling on the client** — the `.obj` parser is pure Python (`struct`); no `dumpbin.exe`, no MSVC toolchain on the path.
+- **Robust COFF parsing (LIEF)** — the `.obj` parser is backed by [LIEF](https://lief.re) by default for exact function bounds (COMDAT/aux symbols), multi-arch relocation types, and library-grade validation. A zero-dependency pure-Python fallback is kept for x86-32 and selectable via `--parser`.
 - **Headless testable** — all matching logic is a pure-Python package; the included pytest suite runs with no IDA and no server.
 
 ## Requirements
 
 - Python 3.9+
-- `capstone` (`pip install capstone`) — only needed for the side-by-side instruction diff, not the summary
+- `capstone` (`pip install capstone`) — needed for the side-by-side instruction diff display
+- `lief` (`pip install lief`) — COFF `.obj` parser (recommended; falls back to the pure-Python parser when absent)
 - IDA Pro 7.x+ with Python support (for the server plugin only)
+
+### Development / Build Requirements (Builders only)
+End users can install prebuilt wheels directly and do **not** need Rust or cargo installed. Developers building from source or modifying the native extension require:
+- Rust toolchain (`rustup install stable`, rustc ≥ 1.88)
+- Maturin (`pip install maturin`)
 
 ## Installation
 
+### 1. From Prebuilt Wheels (End Users)
 ```bash
-pip install -e .
+pip install ida_matcher-0.1.0-cp39-abi3-<platform>.whl
+```
+
+### 2. From Source (Development / Mixed Rust+Python Layout)
+```bash
+# Clone with submodules (includes vendor/objdiff)
+git clone --recurse-submodules https://github.com/.../ida_live_matching_diff.git
+cd ida_live_matching_diff
+
+# Build and install editable package via Maturin
+pip install -e . --no-build-isolation
+```
+
+To build distributable release wheels for all platforms:
+```bash
+maturin build --release
 ```
 
 This installs two console commands: `ida-match` (one-shot) and `ida-watch` (re-run on every rebuild). To run without installing, use the module entry points instead:
@@ -142,6 +164,7 @@ The watcher keeps running even if a match fails (e.g. server momentarily down). 
 | `--func <mangled>` | `ida-match`, `ida-watch` | Diff a single function instead of the summary |
 | `--json` | `ida-match` | Machine-readable JSON summary (summary mode only) |
 | `--strict` | `ida-match` | Exit code 1 when any recognized function scores below 100% (CI gate) |
+| `--parser <auto\|lief\|pure>` | both | COFF `.obj` parser backend (`auto` = LIEF when installed; env `IDA_MATCHER_PARSER` also works) |
 | `--no-color` | both | Disable ANSI colors (also honours the `NO_COLOR` env var) |
 
 ## How it works
@@ -159,12 +182,14 @@ ida_matcher/
   matcher/
     ida_server.py      # IDA plugin: HTTP server + hot reload
     ida_logic.py       # IDA-side extraction (bytes/fixups/switches/thunks)
-    coff_parser.py     # pure-Python COFF .obj parser (client)
+    coff_parser.py     # facade: dispatches to LIEF or pure parser
+    coff_lief.py       # LIEF-backed .obj parser (default)
+    coff_pure.py       # pure-Python .obj parser fallback (x86-32)
     match_core.py      # comparison engine + CLI entry
     run_match.py       # ida-match one-shot entry point
     watch.py           # ida-watch polling entry point
     match.py           # legacy shim -> match_core
-    export_baseline.py # optional offline IDA export (not used by live flow)
+    export_baseline.py # downloads a full GET /baseline snapshot to baseline.json for offline/CI matching
     tests/             # offline pytest suite (no IDA needed)
 ```
 

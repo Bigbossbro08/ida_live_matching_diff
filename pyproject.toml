@@ -1,14 +1,20 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
 [project]
 name = "ida_matcher"
 version = "0.1.0"
 description = "IDA Pro live binary matching and diffing tool"
 requires-python = ">=3.9"
-dependencies = ["capstone"]
+dependencies = ["capstone", "lief"]
 
 [project.scripts]
 ida-match = "ida_matcher.matcher.run_match:main"
 ida-watch  = "ida_matcher.matcher.watch:main"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["ida_matcher*"]
+[tool.maturin]
+manifest-path = "vendor/objdiff-py/Cargo.toml"
+python-packages = ["ida_matcher"]
+module-name = "objdiff_py"
+bindings = "pyo3"

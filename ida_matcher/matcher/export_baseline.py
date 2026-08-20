@@ -1,48 +1,63 @@
-import ida_funcs
-import ida_name
-import ida_bytes
-import idautils
+"""
+ida_matcher.matcher.export_baseline
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Client-side tool that downloads a full baseline snapshot from the running
+IDA server's ``GET /baseline`` endpoint and writes it to a JSON file.
+
+Usage::
+
+    python -m ida_matcher.matcher.export_baseline [--out baseline.json]
+                                                   [--host 127.0.0.1]
+                                                   [--port 28000]
+
+The resulting ``baseline.json`` can later be fed to ``ida-match --baseline``
+so matching runs fully offline (CI, no IDA needed).
+"""
 import json
 import os
+import sys
 import argparse
+import urllib.request
 
-def export_baseline(output_path):
-    print(f"Exporting baseline functions to {output_path}...")
-    functions = {}
-    
-    for ea in idautils.Functions():
-        func = ida_funcs.get_func(ea)
-        name = ida_name.get_name(ea)
-        
-        # Skip compiler-generated or generic subroutines if desired,
-        # but for now we export everything that has a name.
-        if name and not name.startswith("sub_"):
-            # Get function bytes
-            size = func.end_ea - func.start_ea
-            # Read bytes using ida_bytes
-            try:
-                raw_bytes = ida_bytes.get_bytes(func.start_ea, size)
-                if raw_bytes:
-                    hex_bytes = raw_bytes.hex()
-                    functions[name] = {
-                        "ea": hex(func.start_ea),
-                        "size": size,
-                        "bytes": hex_bytes
-                    }
-            except Exception as e:
-                print(f"Failed to read {name}: {e}")
 
+def export_baseline(output_path, host="127.0.0.1", port=28000):
+    """GET /baseline from the IDA server and write the snapshot to *output_path*.
+
+    Returns the number of records written, or raises on failure.
+    """
+    url = f"http://{host}:{port}/baseline"
+    with urllib.request.urlopen(url, timeout=120) as response:
+        raw = response.read()
+    records = json.loads(raw.decode("utf-8"))
+    with open(output_path, "w") as f:
+        json.dump(records, f, indent=2)
+    return len(records)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="export-baseline",
+        description="Download a baseline snapshot from the IDA server.",
+    )
+    parser.add_argument(
+        "--out", default="baseline.json", help="Output JSON path (default: baseline.json)"
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="IDA server host (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=28000, help="IDA server port (default: 28000)"
+    )
+    args = parser.parse_args()
+
+    out_path = os.path.abspath(args.out)
     try:
-        with open(output_path, "w") as f:
-            json.dump(functions, f, indent=2)
-        print(f"Successfully exported {len(functions)} functions")
+        count = export_baseline(out_path, host=args.host, port=args.port)
+        print(f"Baseline exported: {count} records -> {out_path}")
     except Exception as e:
-        print(f"Failed to write JSON: {e}")
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Export IDA baseline functions")
-    parser.add_argument("--out", default="baseline.json", help="Output JSON path")
-    args = parser.parse_args()
-    
-    out_path = os.path.abspath(args.out)
-    export_baseline(out_path)
+    main()

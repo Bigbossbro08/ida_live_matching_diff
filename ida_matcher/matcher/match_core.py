@@ -8,220 +8,32 @@ import sys
 import os
 import json
 import re
+import struct
 import urllib.request
 import urllib.parse
-import difflib
 from pathlib import Path
-
-from ida_matcher.matcher.coff_parser import load_obj
 
 try:
     import capstone
-    HAS_CAPSTONE = True
 except ImportError:
-    HAS_CAPSTONE = False
+    pass
+
+from ida_matcher.matcher.coff_parser import load_obj
+from ida_matcher.matcher.engine.types import (
+    DEFAULT_RELOC_WIDTH, RELOC_MODE_NAME_ADDRESS, RELOC_MODE_NONE, RELOC_MODE_DATA_VALUE, RELOC_MODE_ALL,
+    _DiffContext, _InsnSource, InsnRef
+)
+from ida_matcher.matcher.engine.diff_code import (
+    diff_code, _strip_switch_ranges, reloc_eq, symbol_name_matches, is_symbol_name_compiler_generated
+)
+from ida_matcher.matcher.engine.display import (
+    diff_function, _configure_colors, GREEN, RED, YELLOW, DIM, RESET
+)
+from ida_matcher.matcher.engine.data import (
+    diff_data_symbol, diff_bss_symbol, diff_data_section, diff_bss_section
+)
 
 IDA_SERVER_URL = "http://127.0.0.1:28000/func?name="
-
-GREEN  = "\033[92m"
-RED    = "\033[91m"
-YELLOW = "\033[93m"
-RED_BG = "\033[41m"
-RESET  = "\033[0m"
-DIM    = "\033[2m"
-
-def _configure_colors(enabled):
-    """Switch ANSI color codes on/off (NO_COLOR, --no-color, --json)."""
-    global GREEN, RED, YELLOW, RED_BG, RESET, DIM
-    if not enabled:
-        GREEN = RED = YELLOW = RED_BG = RESET = DIM = ""
-
-# Reloc/fixup windows are matched by byte offset; a 2-byte or 4-byte relocation
-# masks the bytes it covers so absolute addresses don't cause false mismatches.
-DEFAULT_RELOC_WIDTH = 4
-
-_ANON_SYM_RE = re.compile(r'^(?:sub|unk|loc|off|byte|word|dword|qword|asc|jpt|def)_[0-9a-fA-F_]+$')
-_MSVC_LOCAL_LABEL_RE = re.compile(r'^\$L_?\d+$')
-
-def _reloc_byte_map(relocs, widths=None, default=DEFAULT_RELOC_WIDTH):
-    """Flatten {reloc_offset: name} (+ optional per-reloc widths) into {byte_index: name}."""
-    byte_map = {}
-    for off, name in relocs.items():
-        w = (widths or {}).get(off, default)
-        for i in range(w):
-            byte_map[off + i] = name
-    return byte_map
-
-def _normalize_target_name(name):
-    """Make obj-symbol and IDA-name spellings comparable (C decl/import/thunk prefixes)."""
-    n = str(name).strip()
-    n = re.sub(r'^__imp_', '', n)
-    n = re.sub(r'^j_', '', n)      # IDA jump-thunk stub names: j_printf / j_?Foo@@...
-    n = re.sub(r'^_', '', n)
-    return n
-
-def _looks_anonymous(name):
-    """Address-derived labels (sub_401000, unk_402000, ...) carry no symbol identity."""
-    n = str(name).lstrip('@?')
-    if _ANON_SYM_RE.match(n):
-        return True
-    if _MSVC_LOCAL_LABEL_RE.match(n):
-        return True
-    if n.startswith('0x'):
-        return True
-    # Bare hex like the tail of j_435BFD after prefix stripping.
-    if re.fullmatch(r'(?=.*\d)[0-9a-fA-F]{4,}', n):
-        return True
-    return False
-
-def _reloc_symbols_match(name_a, name_b):
-    """True when two reloc targets are (probably) the same symbol.
-
-    Both sides relocated => the underlying values differ by construction, so the
-    only way to catch a *real* change (e.g. printf -> puts at a call site) is to
-    compare the target names. Anonymous DB labels are treated as compatible.
-    """
-    a = _normalize_target_name(name_a)
-    b = _normalize_target_name(name_b)
-    if a == b:
-        return True
-    if _looks_anonymous(a) or _looks_anonymous(b):
-        return True
-    return False
-
-def _sym_ref_in_line(line):
-    m = re.search(r'<([^>]+)>', line)
-    return m.group(1) if m else None
-
-def _strip_switch_ranges(data_bytes, fixups, switch_ranges, reloc_widths=None):
-    """Drop jump-table (.rdata) byte ranges so they don't penalize the
-    match. Fixup offsets are remapped onto the stripped buffer.
-    """
-    if not switch_ranges:
-        if reloc_widths is not None:
-            return data_bytes, fixups, reloc_widths
-        return data_bytes, fixups
-
-    drop = [False] * len(data_bytes)
-    for start, end in switch_ranges:
-        for i in range(max(0, start), min(end, len(data_bytes))):
-            drop[i] = True
-
-    new_bytes = bytearray()
-    new_fixups = {}
-    new_widths = {}
-    removed = 0
-    for i, b in enumerate(data_bytes):
-        if drop[i]:
-            removed += 1
-            continue
-        new_bytes.append(b)
-        if i in fixups:
-            new_fixups[i - removed] = fixups[i]
-        if reloc_widths is not None and i in reloc_widths:
-            new_widths[i - removed] = reloc_widths[i]
-
-    if reloc_widths is not None:
-        return new_bytes, new_fixups, new_widths
-    return new_bytes, new_fixups
-
-def compare_functions(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, obj_reloc_widths=None, base_switch_ranges=None):
-    base_bytes_hex = re.sub(r'[^0-9a-fA-F]', '', base_bytes_hex)
-    if len(base_bytes_hex) % 2 != 0:
-        base_bytes_hex = base_bytes_hex[:-1]
-
-    base_bytes = bytearray.fromhex(base_bytes_hex)
-    obj_bytes = bytearray(obj_bytes)
-
-    if base_switch_ranges:
-        base_bytes, base_fixups = _strip_switch_ranges(base_bytes, base_fixups, base_switch_ranges)
-        obj_bytes, obj_relocs, obj_reloc_widths = _strip_switch_ranges(
-            obj_bytes, obj_relocs, base_switch_ranges, obj_reloc_widths or {}
-        )
-
-    while obj_bytes and obj_bytes[-1] in (0x90, 0xCC):
-        obj_bytes.pop()
-    while base_bytes and base_bytes[-1] in (0x90, 0xCC):
-        base_bytes.pop()
-
-    obj_reloc_map = _reloc_byte_map(obj_relocs, obj_reloc_widths)
-    base_fixup_map = _reloc_byte_map(base_fixups)
-
-    total_count = max(len(obj_bytes), len(base_bytes))
-    if total_count == 0:
-        return 0.0, 0
-
-    # LCS alignment via difflib: inserted/deleted bytes resync instead of
-    # shifting every later byte out of phase (one leading NOP no longer
-    # decimates the score). SequenceMatcher needs a *transitive* token space,
-    # so we first align on (kind, value) tokens -- concrete bytes by value, any
-    # relocated byte (own reloc OR other-side fixup window) as one reloc token.
-    def align_tokens(data, reloc_map, other_reloc_map):
-        return [
-            ("r", 0) if (reloc_map.get(i) is not None or other_reloc_map.get(i) is not None) else ("b", data[i])
-            for i in range(len(data))
-        ]
-
-    obj_tokens = align_tokens(obj_bytes, obj_reloc_map, base_fixup_map)
-    base_tokens = align_tokens(base_bytes, base_fixup_map, obj_reloc_map)
-
-    # Second pass: re-apply the exact per-byte semantics on the aligned pairs.
-    # * both relocated -> match iff _reloc_symbols_match (symbols align)
-    # * one side relocated, other concrete -> not comparable -> match
-    # * both concrete -> match iff byte-equal
-    match_count = 0
-    for i, j, size in difflib.SequenceMatcher(None, obj_tokens, base_tokens, autojunk=False).get_matching_blocks():
-        for k in range(size):
-            o_sym = obj_reloc_map.get(i + k)
-            b_sym = base_fixup_map.get(j + k)
-            if o_sym is not None and b_sym is not None:
-                if _reloc_symbols_match(o_sym, b_sym):
-                    match_count += 1
-            elif o_sym is not None or b_sym is not None:
-                match_count += 1
-            elif obj_bytes[i + k] == base_bytes[j + k]:
-                match_count += 1
-
-    return (match_count / total_count) * 100, total_count
-
-def fetch_from_ida(func_name):
-    """Fetch a single function record; returns None for 404 and any transport error."""
-    encoded_name = urllib.parse.quote(func_name)
-    url = IDA_SERVER_URL + encoded_name
-    try:
-        with urllib.request.urlopen(url, timeout=30) as response:
-            data = json.loads(response.read().decode())
-            if "bytes" in data:
-                return data
-    except Exception:
-        return None
-    return None
-
-def fetch_many_from_ida(names):
-    """Fetch several functions in one round trip via GET /funcs?names=a,b,c.
-
-    Returns {name: record} (thin funcs are absent) or None if the batch failed.
-    Batch is the normal path for `match_summary`; without it, N functions cost
-    N separate HTTP round trips (each scheduled on the 100 ms IDA timer).
-    """
-    if not names:
-        return {}
-    url = "http://127.0.0.1:28000/funcs?names=" + urllib.parse.quote(",".join(names))
-    try:
-        with urllib.request.urlopen(url, timeout=60) as response:
-            data = json.loads(response.read().decode())
-        results = data.get("results") or {}
-        return {k: v for k, v in results.items() if v is not None}
-    except Exception:
-        return None
-
-def server_alive():
-    """True when the live IDA server responds to GET /health."""
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:28000/health", timeout=3) as response:
-            return response.status == 200
-    except Exception:
-        return False
 
 def _disassemble(raw_bytes, base_offset=0):
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
@@ -240,7 +52,6 @@ def _normalize_insn(addr, mnemonic, op_str, insn_bytes, relocs, widths=None):
     if intersecting_relocs:
         target = intersecting_relocs[0]
         if re.search(r'0x[0-9a-fA-F]+', op_str):
-            # Replace the address tokens only - keep registers ([eax], ds:...).
             op_str = re.sub(r'0x[0-9a-fA-F]+', f'<{target}>', op_str)
         else:
             op_str += f" ; <{target}>"
@@ -266,85 +77,163 @@ def _insn_has_reloc(addr, insn_bytes, relocs, widths=None):
             return True
     return False
 
-def highlight_diff_inline(base_text, obj_text):
-    sm = difflib.SequenceMatcher(None, base_text, obj_text, autojunk=False)
-    base_colored = ""
-    obj_colored = ""
+def is_objdiff_py_enabled() -> bool:
+    """Return True if the native Rust objdiff_py diff engine is enabled via OBJDIFF_PY env var."""
+    val = os.environ.get("OBJDIFF_PY", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
 
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        b_chunk = base_text[i1:i2]
-        o_chunk = obj_text[j1:j2]
 
-        if tag == 'equal':
-            base_colored += b_chunk
-            obj_colored += o_chunk
+def get_diff_direction(mappings_config=None, override=None) -> str:
+    """Resolve diff direction: 'left_to_right' (default) or 'right_to_left'."""
+    if override:
+        return override
+    env_dir = os.environ.get("OBJDIFF_DIFF_DIRECTION", "").strip().lower()
+    if env_dir in ("right_to_left", "rtl", "objdiff"):
+        return "right_to_left"
+    if isinstance(mappings_config, dict):
+        cfg_dir = str(mappings_config.get("diff_direction", "")).strip().lower()
+        if cfg_dir in ("right_to_left", "rtl", "objdiff"):
+            return "right_to_left"
+    elif hasattr(mappings_config, "diff_direction"):
+        cfg_dir = str(getattr(mappings_config, "diff_direction", "")).strip().lower()
+        if cfg_dir in ("right_to_left", "rtl", "objdiff"):
+            return "right_to_left"
+    return "left_to_right"
+
+
+def _apply_reloc_mappings(obj_relocs, reloc_mappings):
+    """Rewrite reloc target names from the obj's naming scheme (MSVC mangled)
+    to the IDA-side names (e.g. Itanium mangled) so reloc_eq matches them.
+
+    obj_relocs values are either a bare symbol name (str) or a tuple whose
+    first element is the target symbol name (rest = width/class/addend/...).
+
+    Mapped relocs get a trailing True flag so reloc_eq knows the name match is
+    authoritative: the IDA side records the resolved VA as its addend and its
+    enclosing section, while the obj side records addend 0 and the target's
+    real section, so those fields must not be compared for mapped names."""
+    if not reloc_mappings:
+        return obj_relocs
+    out = {}
+    for off, v in obj_relocs.items():
+        if isinstance(v, tuple):
+            name = v[0]
+            if name in reloc_mappings:
+                out[int(off)] = (reloc_mappings[name],) + tuple(v[1:]) + (True,)
+            else:
+                out[int(off)] = v
         else:
-            if b_chunk:
-                base_colored += f"{RED_BG}{b_chunk}{RESET}{RED}"
-            if o_chunk:
-                obj_colored += f"{RED_BG}{o_chunk}{RESET}{RED}"
+            out[int(off)] = reloc_mappings.get(str(v), v)
+    return out
 
-    return base_colored, obj_colored
 
-def print_hexdump_diff(obj_bytes, base_bytes, obj_relocs, base_fixups, obj_reloc_widths=None):
-    COL_W = 48
-    print(f"\n{'Base (IDA) Hex Dump':<{COL_W}} | {'Local (.obj) Hex Dump':<{COL_W}}")
-    print("-" * COL_W + "+" + "-" * COL_W)
+def fetch_synthetic_obj_from_ida(func_name: str) -> bytes | None:
+    """Fetch raw synthetic COFF .obj bytes for a symbol from IDA server."""
+    encoded_name = urllib.parse.quote(func_name)
+    url = f"http://127.0.0.1:28000/synthetic_obj?name={encoded_name}"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            if response.status == 200:
+                return response.read()
+    except Exception:
+        return None
+    return None
 
-    max_len = max(len(obj_bytes), len(base_bytes))
-    
-    obj_reloc_indices = set()
-    for r_off in obj_relocs.keys():
-        w = (obj_reloc_widths or {}).get(r_off, DEFAULT_RELOC_WIDTH)
-        for i in range(w): obj_reloc_indices.add(r_off + i)
-            
-    base_fixup_indices = set()
-    for r_off in base_fixups.keys():
-        for i in range(DEFAULT_RELOC_WIDTH): base_fixup_indices.add(r_off + i)
 
-    for offset in range(0, max_len, 16):
-        b_chunk = base_bytes[offset:offset+16]
-        o_chunk = obj_bytes[offset:offset+16]
-        
-        b_str, o_str = "", ""
-        for i in range(16):
-            abs_i = offset + i
-            
-            b_val = f"{b_chunk[i]:02X}" if i < len(b_chunk) else "  "
-            o_val = f"{o_chunk[i]:02X}" if i < len(o_chunk) else "  "
-            
-            is_o_reloc = abs_i in obj_reloc_indices
-            is_b_reloc = abs_i in base_fixup_indices
-            is_match = i < len(b_chunk) and i < len(o_chunk) and b_chunk[i] == o_chunk[i]
-            
-            if i >= len(b_chunk):
-                b_str += "   "
-            elif is_b_reloc:
-                b_str += f"{YELLOW}{b_val}{RESET} "
-            elif is_match:
-                b_str += f"{GREEN}{b_val}{RESET} "
-            else:
-                b_str += f"{RED_BG}{b_val}{RESET} "
-                
-            if i >= len(o_chunk):
-                o_str += "   "
-            elif is_o_reloc:
-                o_str += f"{YELLOW}{o_val}{RESET} "
-            elif is_match:
-                o_str += f"{GREEN}{o_val}{RESET} "
-            else:
-                o_str += f"{RED_BG}{o_val}{RESET} "
-                
-        print(f"{b_str} | {o_str}")
+def _compare_functions_objdiff_py(obj_bytes, base_bytes, obj_relocs, base_fixups, obj_reloc_widths=None, arch="x86", diff_direction=None):
+    from objdiff_py import ObjectBuilder, diff_objects
 
-def diff_function(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, base_switches=None, obj_reloc_widths=None, base_switch_ranges=None):
-    if not HAS_CAPSTONE:
-        print(f"{RED}Error: capstone module not installed. Run: pip install capstone{RESET}")
-        return 0.0
+    b_left = ObjectBuilder(arch)
+    sec_l = b_left.add_section(".text", "", 0)
+    if obj_bytes:
+        b_left.write_bytes(sec_l, 0, bytes(obj_bytes))
+    sym_l = b_left.add_symbol(sec_l, "target_func", 0, len(obj_bytes), 2, 0)
+    l_map = {}
+    for r_off, r_target in obj_relocs.items():
+        if isinstance(r_target, tuple):
+            r_name = r_target[0]
+            r_width = r_target[1]
+            r_cls = r_target[2]
+            r_addend = r_target[3] if len(r_target) > 3 else 0
+        else:
+            r_name = str(r_target)
+            r_width = (obj_reloc_widths or {}).get(r_off, 4)
+            r_cls = "absolute"
+            r_addend = 0
+        if r_name not in l_map:
+            l_map[r_name] = b_left.add_symbol(0xFFFFFFFF, r_name, 0, 0, 3, 0)
+        reloc_kind = 1 if r_cls == "relative" or r_width == 2 else 6
+        writer_addend = int(r_addend) - 4 if r_cls == "relative" else (0 if r_width == 2 else int(r_addend))
+        b_left.add_relocation(sec_l, int(r_off), l_map[r_name], reloc_kind, int(r_width), writer_addend)
+    left_obj = b_left.finish()
 
+    b_right = ObjectBuilder(arch)
+    sec_r = b_right.add_section(".text", "", 0)
+    r_data = bytearray(bytes(base_bytes)) if base_bytes else bytearray()
+    for r_off, r_target in base_fixups.items():
+        if isinstance(r_target, tuple):
+            r_width = r_target[1]
+            r_addend = r_target[3] if len(r_target) > 3 else 0
+        else:
+            r_width = 4
+            r_addend = 0
+        off = int(r_off)
+        w = int(r_width)
+        add = int(r_addend)
+        if off + w <= len(r_data):
+            if w == 4:
+                r_data[off:off + 4] = struct.pack("<i", add)
+            elif w == 2:
+                r_data[off:off + 2] = struct.pack("<h", add)
+            elif w == 8:
+                r_data[off:off + 8] = struct.pack("<q", add)
+
+    if r_data:
+        b_right.write_bytes(sec_r, 0, bytes(r_data))
+    sym_r = b_right.add_symbol(sec_r, "target_func", 0, len(r_data), 2, 0)
+    r_map = {}
+    for r_off, r_target in base_fixups.items():
+        if isinstance(r_target, tuple):
+            r_name = r_target[0]
+            r_width = r_target[1]
+            r_cls = r_target[2]
+            r_addend = r_target[3] if len(r_target) > 3 else 0
+        else:
+            r_name = str(r_target)
+            r_width = 4
+            r_cls = "absolute"
+            r_addend = 0
+        if r_name not in r_map:
+            r_map[r_name] = b_right.add_symbol(0xFFFFFFFF, r_name, 0, 0, 3, 0)
+        reloc_kind = 1 if r_cls == "relative" or r_width == 2 else 6
+        writer_addend = int(r_addend) - 4 if r_cls == "relative" else (0 if r_width == 2 else int(r_addend))
+        b_right.add_relocation(sec_r, int(r_off), r_map[r_name], reloc_kind, int(r_width), writer_addend)
+    right_obj = b_right.finish()
+
+    direction = get_diff_direction(override=diff_direction)
+    if direction == "right_to_left":
+        diff_res = diff_objects(right_obj, left_obj)
+    else:
+        diff_res = diff_objects(left_obj, right_obj)
+
+    syms = (diff_res.get("left") or {}).get("symbols", [])
+    if syms and syms[0].get("match_percent") is not None:
+        pct = float(syms[0]["match_percent"])
+        diff_score = tuple(syms[0]["diff_score"]) if syms[0].get("diff_score") else (0, 0)
+    else:
+        pct = 0.0
+        diff_score = (0, 0)
+    return pct, diff_score
+
+
+def compare_functions(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, obj_reloc_widths=None, base_switch_ranges=None,
+                      reloc_mode=RELOC_MODE_NAME_ADDRESS, return_details=False, left_accessor=None, right_accessor=None, arch="x86",
+                      diff_direction=None):
+    """Instruction-level match of an .obj function against the IDA-served bytes."""
     base_bytes_hex = re.sub(r'[^0-9a-fA-F]', '', base_bytes_hex)
     if len(base_bytes_hex) % 2 != 0:
         base_bytes_hex = base_bytes_hex[:-1]
+
     base_bytes = bytearray.fromhex(base_bytes_hex)
     obj_bytes = bytearray(obj_bytes)
 
@@ -359,96 +248,327 @@ def diff_function(obj_bytes, base_bytes_hex, obj_relocs, base_fixups, base_switc
     while base_bytes and base_bytes[-1] in (0x90, 0xCC):
         base_bytes.pop()
 
-    print_hexdump_diff(obj_bytes, base_bytes, obj_relocs, base_fixups, obj_reloc_widths)
+    total_count = max(len(obj_bytes), len(base_bytes))
+    if total_count == 0:
+        if return_details:
+            return 0.0, 0, (0, 0)
+        return 0.0, 0
 
-    base_insns = _disassemble(base_bytes, base_offset=0)
-    obj_insns = _disassemble(obj_bytes, base_offset=0)
+    if is_objdiff_py_enabled():
+        try:
+            pct, diff_score = _compare_functions_objdiff_py(
+                bytes(obj_bytes), bytes(base_bytes), obj_relocs, base_fixups,
+                obj_reloc_widths=obj_reloc_widths, arch=arch, diff_direction=diff_direction
+            )
+            if return_details:
+                return pct, total_count, diff_score
+            return pct, total_count
+        except Exception:
+            pass
 
-    base_fixup_widths = {k: DEFAULT_RELOC_WIDTH for k in base_fixups}
-    obj_reloc_widths = obj_reloc_widths or {}
+    result = diff_code(
+        bytes(obj_bytes), obj_relocs, obj_reloc_widths or {},
+        bytes(base_bytes), base_fixups, {k: DEFAULT_RELOC_WIDTH for k in base_fixups},
+        reloc_mode=reloc_mode, left_data_accessor=left_accessor, right_data_accessor=right_accessor, arch=arch
+    )
+    if return_details:
+        return result["match_percent"], total_count, (result["diff_score"], result["max_score"])
+    return result["match_percent"], total_count
 
-    base_lines, base_meta = [], []
-    for addr, mn, op, ib in base_insns:
-        base_lines.append(_normalize_insn(addr, mn, op, ib, base_fixups, base_fixup_widths))
-        base_meta.append((addr, ib))
+def find_symbol(left_name: str, obj_funcs: dict, all_base_records: dict, right_used: set, fuzzy_literals: bool) -> str:
+    from .engine.diff_code import symbol_name_matches, is_symbol_name_compiler_generated
+    left_sym = obj_funcs[left_name]
+    section_kind = left_sym.get("section_kind", "code")
+    section_name = left_sym.get("section_name", section_kind)
+    left_flags = left_sym.get("flags", [])
+    left_size = left_sym.get("size", 0)
 
-    obj_lines, obj_meta = [], []
-    for addr, mn, op, ib in obj_insns:
-        obj_lines.append(_normalize_insn(addr, mn, op, ib, obj_relocs, obj_reloc_widths))
-        obj_meta.append((addr, ib))
+    is_cg = "CompilerGenerated" in left_flags or is_symbol_name_compiler_generated(left_name)
 
-    COL_W = 42
-    print(f"\n{'Base (IDA Database)':<{COL_W}} | {'Local Compiled (.obj)':<{COL_W}}")
-    print("-" * COL_W + "+" + "-" * COL_W)
+    if is_cg and section_kind in ("code", "data", "bss"):
+        closest_right_name = None
+        closest_match_percent = 0.0
 
-    sm = difflib.SequenceMatcher(None, base_lines, obj_lines, autojunk=False)
-    match_count = total_count = 0
+        for right_name, right_sym in all_base_records.items():
+            if right_name in right_used:
+                continue
+            r_sec_name = right_sym.get("section_name", "")
+            r_sec_kind = right_sym.get("section_kind", "unknown")
+            r_cg = right_sym.get("compiler_generated", False) or is_symbol_name_compiler_generated(right_name)
 
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == 'equal':
-            for bi in range(i1, i2):
-                line = base_lines[bi]
-                print(f"{GREEN}{line:<{COL_W}} | {obj_lines[bi + (j1 - i1)]:<{COL_W}}{RESET}")
-                match_count += 1
-                total_count += 1
-        elif tag == 'replace':
-            pairs = list(zip(range(i1, i2), range(j1, j2)))
-            for bi, oi in pairs:
-                total_count += 1
-                b_has_reloc = _insn_has_reloc(base_meta[bi][0], base_meta[bi][1], base_fixups, base_fixup_widths)
-                o_has_reloc = _insn_has_reloc(obj_meta[oi][0], obj_meta[oi][1], obj_relocs, obj_reloc_widths)
+            # Relink units place code in a custom section (.rogan2) while the
+            # base binary's code lives in .text; code sections are equivalent
+            # regardless of the exact section name.
+            sec_name_ok = (r_sec_name == section_name) or (section_kind == "code" and r_sec_kind == "code")
+            if not sec_name_ok or r_sec_kind != section_kind or not r_cg:
+                continue
 
-                if b_has_reloc or o_has_reloc:
-                    b_sym = _sym_ref_in_line(base_lines[bi])
-                    o_sym = _sym_ref_in_line(obj_lines[oi])
-                    tag_str = ""
-                    w = max(0, COL_W - len(tag_str))
-                    if b_sym and o_sym and not _reloc_symbols_match(b_sym, o_sym):
-                        tag_str = f" [RELOC!= {b_sym} != {o_sym}]"
-                        w = max(0, COL_W - len(tag_str))
-                        print(f"{RED}{base_lines[bi]:<{COL_W}} | {obj_lines[oi]:<{w}}{tag_str}{RESET}")
-                    else:
-                        tag_str = " [RELOC]"
-                        w = max(0, COL_W - len(tag_str))
-                        print(f"{YELLOW}{base_lines[bi]:<{COL_W}} | {obj_lines[oi]:<{w}}{tag_str}{RESET}")
-                        match_count += 1
-                else:
-                    b_hl, o_hl = highlight_diff_inline(base_lines[bi], obj_lines[oi])
-                    b_pad = " " * max(0, COL_W - len(base_lines[bi]))
-                    o_pad = " " * max(0, COL_W - len(obj_lines[oi]))
-                    print(f"{RED}{b_hl}{b_pad} | {o_hl}{o_pad}{RESET}")
+            if section_kind in ("code", "data"):
+                pct = compare_for_pairing(left_name, right_name, obj_funcs, all_base_records)
+                if pct == 100.0 or (fuzzy_literals and pct >= 50.0 and pct > closest_match_percent):
+                    closest_right_name = right_name
+                    closest_match_percent = pct
+                    if pct == 100.0:
+                        break
+            elif section_kind == "bss":
+                if left_size == right_sym.get("size", 0):
+                    closest_right_name = right_name
+                    break
 
-            if i2 - i1 > j2 - j1:
-                for bi in range(i1 + (j2 - j1), i2):
-                    total_count += 1
-                    print(f"{RED}{base_lines[bi]:<{COL_W}} | {'(missing)':<{COL_W}}{RESET}")
-            elif j2 - j1 > i2 - i1:
-                for oi in range(j1 + (i2 - i1), j2):
-                    total_count += 1
-                    print(f"{RED}{'(missing)':<{COL_W}} | {obj_lines[oi]:<{COL_W}}{RESET}")
+        return closest_right_name
 
-        elif tag == 'delete':
-            for bi in range(i1, i2):
-                total_count += 1
-                print(f"{RED}{base_lines[bi]:<{COL_W}} | {'(missing)':<{COL_W}}{RESET}")
-        elif tag == 'insert':
-            for oi in range(j1, j2):
-                total_count += 1
-                print(f"{RED}{'(missing)':<{COL_W}} | {obj_lines[oi]:<{COL_W}}{RESET}")
+    for right_name, right_sym in all_base_records.items():
+        if right_name in right_used:
+            continue
+        r_sec_name = right_sym.get("section_name", "")
+        r_sec_kind = right_sym.get("section_kind", "unknown")
 
-    if base_switches:
-        print("-" * (COL_W * 2 + 1))
-        print(f"Detected {len(base_switches)} Jump Table(s) in IDA Database:")
-        for insn_offset, targets in base_switches.items():
-            print(f"{DIM}  Indirect Jump at function offset {insn_offset}:{RESET}")
-            for i, tgt in enumerate(targets):
-                print(f"    Case {i:<3}: jumps to loc_{tgt}")
+        sec_name_ok = (r_sec_name == section_name) or (section_kind == "code" and r_sec_kind == "code")
+        if symbol_name_matches(left_name, right_name) and r_sec_kind == section_kind and sec_name_ok:
+            return right_name
 
-    pct = (match_count / total_count) * 100 if total_count > 0 else 0.0
-    print("-" * (COL_W * 2 + 1))
-    color = GREEN if pct == 100.0 else (YELLOW if pct >= 80.0 else RED)
-    print(f"{color}Instruction match: {match_count}/{total_count} ({pct:.2f}%){RESET}")
+    return None
+
+def compare_for_pairing(left_name, right_name, obj_funcs, all_base_records):
+    left_sym = obj_funcs[left_name]
+    right_sym = all_base_records[right_name]
+
+    b_f_w = right_sym.get("fixup_widths", {})
+    b_f_c = right_sym.get("fixup_classes", {})
+    b_f_a = right_sym.get("fixup_addends", {})
+    b_sym_a = right_sym.get("fixup_sym_addrs", {})
+    b_sym_s = right_sym.get("fixup_sym_sizes", {})
+    b_sym_k = right_sym.get("fixup_sym_kinds", {})
+    base_fixups = {}
+    for k, v in right_sym.get("fixups", {}).items():
+        base_fixups[int(k)] = (v, b_f_w.get(str(k), 4), b_f_c.get(str(k), "absolute"), b_f_a.get(str(k), 0),
+                               "", "unknown", b_sym_a.get(str(k), 0), b_sym_s.get(str(k), 0), b_sym_k.get(str(k), "unknown"))
+
+    l_f_w = left_sym.get("reloc_widths", {})
+    left_relocs = left_sym.get("relocs", {})
+
+    left_bytes = left_sym.get("bytes", b"")
+    right_bytes = bytes.fromhex(right_sym.get("bytes", "")) if right_sym.get("bytes") else b""
+
+    pct, _ = diff_data_symbol(left_bytes, right_bytes, left_relocs, base_fixups, l_f_w, {int(k): v for k, v in b_f_w.items()})
     return pct
+
+def apply_symbol_mappings(obj_funcs, all_base_records, mappings_config, left_used, right_used, matches):
+    selecting_left = mappings_config.get("selecting_left")
+    selecting_right = mappings_config.get("selecting_right")
+    
+    if selecting_left and selecting_left in obj_funcs:
+        left_used.add(selecting_left)
+    if selecting_right and selecting_right in all_base_records:
+        right_used.add(selecting_right)
+        
+    mappings = mappings_config.get("mappings", {})
+    for left_name, right_name in mappings.items():
+        if left_name not in obj_funcs or left_name in left_used:
+            continue
+        if right_name not in all_base_records or right_name in right_used:
+            continue
+            
+        l_sec_kind = obj_funcs[left_name].get("section_kind", "unknown")
+        r_sec_kind = all_base_records[right_name].get("section_kind", "unknown")
+        if l_sec_kind != r_sec_kind:
+            continue
+            
+        matches.append((left_name, right_name))
+        left_used.add(left_name)
+        right_used.add(right_name)
+
+def matching_symbols(obj_funcs: dict, all_base_records: dict, mappings_config: dict = None):
+    matches = []
+    left_used = set()
+    right_used = set()
+
+    if mappings_config:
+        apply_symbol_mappings(obj_funcs, all_base_records, mappings_config, left_used, right_used, matches)
+
+    for fuzzy in [False, True]:
+        for left_name, left_sym in obj_funcs.items():
+            if left_name in left_used:
+                continue
+            if left_sym.get("size", 0) == 0 or "Ignored" in left_sym.get("flags", []):
+                continue
+            
+            right_name = find_symbol(left_name, obj_funcs, all_base_records, right_used, fuzzy)
+            if right_name is not None:
+                matches.append((left_name, right_name))
+                left_used.add(left_name)
+                right_used.add(right_name)
+
+    for left_name, left_sym in obj_funcs.items():
+        if left_name not in left_used and left_sym.get("size", 0) > 0 and "Ignored" not in left_sym.get("flags", []):
+            matches.append((left_name, None))
+            left_used.add(left_name)
+
+    return matches
+
+def find_similar_code_symbols(obj_path: Path, source_name: str, parser: str = "auto",
+                              reloc_mode=RELOC_MODE_NAME_ADDRESS) -> int:
+    """objdiff `find_similar_code_symbols` (diff/mod.rs:531): rank every
+    right-side (IDA) code symbol by instruction-diff match_percent against a
+    single .obj code symbol, best first. Returns an exit code."""
+    refresh_ida_cache()
+    obj_funcs = load_obj(obj_path, parser=parser)
+
+    source = obj_funcs.get(source_name)
+    if source is None:
+        print(f"{RED}Symbol '{source_name}' not found in the .obj file.{RESET}")
+        return 0
+    if source.get("section_kind", "code") != "code":
+        print(f"{YELLOW}Symbol '{source_name}' is not a code symbol; nothing to rank.{RESET}")
+        return 0
+
+    if not server_alive():
+        print(
+            f"{RED}Cannot connect to the live IDA server on 127.0.0.1:28000.{RESET}\n"
+            f"{YELLOW}Ensure ida_server.py is running inside IDA, then retry.{RESET}"
+        )
+        return 0
+
+    names = fetch_all_names_from_ida()
+    records = (fetch_many_from_ida(names) if names else {}) or {}
+    if not records:
+        print("No symbols available from the live IDA server.")
+        return 0
+
+    all_base_records = {
+        n: r for n, r in records.items()
+        if r.get("section_kind", "unknown") == "code"
+        and r.get("size", 0) > 0 and r.get("bytes")
+        and not r.get("is_thunk")
+    }
+
+    left_accessor = make_left_accessor(obj_funcs)
+    right_accessor = make_right_accessor(all_base_records)
+
+    results = []
+    for name, rec in all_base_records.items():
+        b_f_w = rec.get("fixup_widths", {})
+        b_f_c = rec.get("fixup_classes", {})
+        b_f_a = rec.get("fixup_addends", {})
+        b_sym_a = rec.get("fixup_sym_addrs", {})
+        b_sym_s = rec.get("fixup_sym_sizes", {})
+        b_sym_k = rec.get("fixup_sym_kinds", {})
+        b_sec_name = rec.get("section_name", "")
+        b_sec_kind = rec.get("section_kind", "code")
+        base_fixups = {}
+        for k, v in rec.get("fixups", {}).items():
+            base_fixups[int(k)] = (v, b_f_w.get(str(k), 4), b_f_c.get(str(k), "absolute"),
+                                   b_f_a.get(str(k), 0), b_sec_name, b_sec_kind,
+                                   b_sym_a.get(str(k), 0), b_sym_s.get(str(k), 0),
+                                   b_sym_k.get(str(k), "unknown"))
+        pct, _ = compare_functions(
+            source["bytes"], rec.get("bytes", ""), source.get("relocs", {}),
+            base_fixups, source.get("reloc_widths", {}), rec.get("switch_ranges", []),
+            reloc_mode=reloc_mode, left_accessor=left_accessor, right_accessor=right_accessor,
+        )
+        results.append((name, pct))
+
+    results.sort(key=lambda r: r[1], reverse=True)
+
+    print(f"{YELLOW}Similar code symbols in IDA for '{source_name}':{RESET}")
+    for name, pct in results:
+        line = f"{pct:5.1f}%  {name}"
+        print(GREEN + line + RESET if pct == 100.0 else line)
+    return 0
+
+def fetch_all_names_from_ida():
+    url = "http://127.0.0.1:28000/all_names"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = json.loads(response.read().decode())
+            return data.get("names", [])
+    except Exception:
+        return []
+
+def fetch_from_ida(func_name):
+    encoded_name = urllib.parse.quote(func_name)
+    url = IDA_SERVER_URL + encoded_name
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = json.loads(response.read().decode())
+            if "bytes" in data:
+                return data
+    except Exception:
+        return None
+    return None
+
+def fetch_many_from_ida(names):
+    if not names:
+        return {}
+    url = "http://127.0.0.1:28000/funcs?names=" + urllib.parse.quote(",".join(names))
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            data = json.loads(response.read().decode())
+        results = data.get("results") or {}
+        return {k: v for k, v in results.items() if v is not None}
+    except Exception:
+        return None
+
+def fetch_data_from_ida(func_name):
+    encoded_name = urllib.parse.quote(func_name)
+    url = "http://127.0.0.1:28000/data?name=" + encoded_name
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = json.loads(response.read().decode())
+            if "bytes" in data:
+                return data
+    except Exception:
+        return None
+    return None
+
+def fetch_many_data_from_ida(names):
+    if not names:
+        return {}
+    url = "http://127.0.0.1:28000/datas?names=" + urllib.parse.quote(",".join(names))
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            data = json.loads(response.read().decode())
+        results = data.get("results") or {}
+        return {k: v for k, v in results.items() if v is not None}
+    except Exception:
+        return None
+
+def make_left_accessor(obj_funcs):
+    def accessor(sym_name):
+        if sym_name not in obj_funcs: return None
+        func = obj_funcs[sym_name]
+        return func.get("section_bytes", func.get("bytes")), func.get("offset", 0)
+    return accessor
+
+def make_right_accessor(base_records, offline=False):
+    def accessor(sym_name):
+        if sym_name not in base_records and not offline:
+            res = fetch_data_from_ida(sym_name)
+            if res:
+                base_records[sym_name] = res
+        rec = base_records.get(sym_name)
+        if not rec: return None
+        raw = bytes.fromhex(rec["bytes"]) if "bytes" in rec else b""
+        return raw, 0
+    return accessor
+
+
+def _load_baseline(baseline):
+    """Accept a baseline as a dict or a path to a JSON file; return the dict."""
+    if isinstance(baseline, dict):
+        return baseline
+    import pathlib
+    p = pathlib.Path(baseline)
+    with open(p, "r") as f:
+        return json.load(f)
+
+def server_alive():
+    """True when the live IDA server responds to GET /health."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:28000/health", timeout=3) as response:
+            return response.status == 200
+    except Exception:
+        return False
 
 def refresh_ida_cache():
     """Ask the live IDA server to rebuild its name->address cache."""
@@ -458,118 +578,360 @@ def refresh_ida_cache():
     except Exception:
         pass
 
-def match_summary(obj_path: Path, json_out: bool = False, strict: bool = False) -> int:
-    """Run a summary match against the live IDA server.
-
-    Returns an exit code: 0 on success, 1 when `strict` is set and any
-    recognized function scored below 100% (CI gate). Server-down / empty obj
-    keep returning 0 for backward compatibility.
-    """
-    refresh_ida_cache()
-    obj_funcs = load_obj(obj_path)
+def match_summary(obj_path: Path, json_out: bool = False, strict: bool = False, parser: str = "auto", reloc_mode=RELOC_MODE_NAME_ADDRESS, mappings_config=None, baseline=None, diff_direction=None) -> int:
+    obj_funcs = load_obj(obj_path, parser=parser)
 
     if not obj_funcs:
-        print("No functions found in the .obj file.")
+        if not json_out: print("No functions found in the .obj file.")
         return 0
 
-    if not server_alive():
-        msg = (
-            f"{RED}Cannot connect to the live IDA server on 127.0.0.1:28000.{RESET}\n"
-            f"{YELLOW}Ensure ida_server.py is running inside IDA, then retry.{RESET}"
-        )
-        if json_out:
-            print(json.dumps({"obj": str(obj_path), "connected": False}))
-        else:
-            print(msg)
-        return 0
+    reloc_mappings = (mappings_config or {}).get("reloc_mappings", {})
+    if reloc_mappings:
+        for name in list(obj_funcs):
+            obj_funcs[name]["relocs"] = _apply_reloc_mappings(
+                obj_funcs[name].get("relocs", {}), reloc_mappings)
 
-    records = fetch_many_from_ida(list(obj_funcs))
-    if records is None:
-        # Old server (no /funcs batch endpoint) - fall back to one call per name.
-        records = {n: rec for n in obj_funcs if (rec := fetch_from_ida(n)) is not None}
+    if baseline is not None:
+        # Offline mode: load base records from baseline, skip all server calls
+        all_base_records = dict(_load_baseline(baseline))
+        left_accessor = make_left_accessor(obj_funcs)
+        right_accessor = make_right_accessor(all_base_records, offline=True)
+    else:
+        # Live mode: unchanged
+        refresh_ida_cache()
+
+        if not server_alive():
+            msg = (
+                f"{RED}Cannot connect to the live IDA server on 127.0.0.1:28000.{RESET}\n"
+                f"{YELLOW}Ensure ida_server.py is running inside IDA, then retry.{RESET}"
+            )
+            if json_out:
+                print(json.dumps({"obj": str(obj_path), "connected": False}))
+            else:
+                print(msg)
+            return 0
+
+        code_syms = [n for n, d in obj_funcs.items() if d.get("section_kind", "code") == "code"]
+        data_syms = [n for n, d in obj_funcs.items() if d.get("section_kind", "code") != "code"]
+
+        records = fetch_many_from_ida(code_syms) or {n: rec for n in code_syms if (rec := fetch_from_ida(n)) is not None}
+        data_records = fetch_many_data_from_ida(data_syms) or {n: rec for n in data_syms if (rec := fetch_data_from_ida(n)) is not None}
+
+        all_base_records = dict(records)
+        all_base_records.update(data_records)
+
+        left_accessor = make_left_accessor(obj_funcs)
+        right_accessor = make_right_accessor(all_base_records)
 
     rows = []
-    for func_name, func_data in obj_funcs.items():
-        base_match = records.get(func_name)
-        row = {"name": func_name, "status": None, "match_pct": None, "count": None}
+    sections_map = {}
+
+    matches = matching_symbols(obj_funcs, all_base_records, mappings_config)
+    direction = get_diff_direction(mappings_config, override=diff_direction)
+
+    for left_name, right_name in matches:
+        func_data = obj_funcs[left_name]
+        kind = func_data.get("section_kind", "code")
+        sec_name = func_data.get("section_name", kind)
+        if sec_name not in sections_map:
+            sections_map[sec_name] = {
+                "name": sec_name, "kind": kind, "symbols": [],
+                "obj_data": func_data.get("section_bytes", b""),
+                "generic_weight": 0.0, "generic_total_size": 0,
+                "right_data": bytearray(), "right_relocs": {}, "left_relocs": {},
+                "right_reloc_widths": {}, "left_reloc_widths": {}
+            }
+
+        row = {"name": left_name, "status": None, "match_pct": None, "count": None, "diff_score": None, "section": sec_name, "size": 0}
+        
+        l_demangled = func_data.get("demangled_name")
+        base_match = all_base_records.get(right_name) if right_name else None
+        r_demangled = base_match.get("demangled_name") if base_match else None
+        
+        if l_demangled or r_demangled:
+            row["demangled_name"] = l_demangled or r_demangled
+
         if base_match is None:
             row["status"] = "not_found"
-        elif base_match.get("is_thunk"):
-            row["status"] = "thunk"
+            size = func_data.get("size", len(func_data["bytes"]))
+            row["count"] = size
+            row["size"] = size
+            row["match_pct"] = 0.0
+        elif kind == "code":
+            if base_match.get("is_thunk"):
+                row["status"] = "thunk"
+                size = func_data.get("size", len(func_data["bytes"]))
+                row["count"] = size
+                row["size"] = size
+            else:
+                b_f_w = base_match.get("fixup_widths", {})
+                b_f_c = base_match.get("fixup_classes", {})
+                b_f_a = base_match.get("fixup_addends", {})
+                b_sym_a = base_match.get("fixup_sym_addrs", {})
+                b_sym_s = base_match.get("fixup_sym_sizes", {})
+                b_sym_k = base_match.get("fixup_sym_kinds", {})
+                b_sec_name = base_match.get("section_name", "")
+                b_sec_kind = base_match.get("section_kind", "unknown")
+                base_fixups = {}
+                for k, v in base_match.get("fixups", {}).items():
+                    base_fixups[int(k)] = (v, b_f_w.get(k, 4), b_f_c.get(k, "absolute"), b_f_a.get(k, 0),
+                                           b_sec_name, b_sec_kind, b_sym_a.get(k, 0), b_sym_s.get(k, 0), b_sym_k.get(k, "unknown"))
+                    
+                l_arch = func_data.get("arch", "x86")
+                r_arch = base_match.get("arch", "x86")
+                arch = "x64" if l_arch == "x64" or r_arch == "x64" else "x86"
+                
+                pct, count, diff_score = compare_functions(
+                    func_data["bytes"], base_match["bytes"], func_data["relocs"],
+                    base_fixups, func_data.get("reloc_widths", {}),
+                    base_match.get("switch_ranges", []),
+                    reloc_mode=reloc_mode,
+                    return_details=True,
+                    left_accessor=left_accessor,
+                    right_accessor=right_accessor,
+                    arch=arch,
+                    diff_direction=direction,
+                )
+                row.update(status="match", match_pct=pct, count=count, diff_score=list(diff_score), size=len(func_data["bytes"]))
         else:
-            base_fixups = {int(k): v for k, v in base_match.get("fixups", {}).items()}
-            pct, count = compare_functions(
-                func_data["bytes"], base_match["bytes"], func_data["relocs"],
-                base_fixups, func_data.get("reloc_widths", {}),
-                base_match.get("switch_ranges", []),
-            )
-            row.update(status="match", match_pct=pct, count=count)
-        rows.append(row)
+            # Data/BSS symbols
+            b_f_w = base_match.get("fixup_widths", {})
+            b_f_c = base_match.get("fixup_classes", {})
+            b_f_a = base_match.get("fixup_addends", {})
+            b_sym_a = base_match.get("fixup_sym_addrs", {})
+            b_sym_s = base_match.get("fixup_sym_sizes", {})
+            b_sym_k = base_match.get("fixup_sym_kinds", {})
+            base_fixups = {}
+            for k, v in base_match.get("fixups", {}).items():
+                base_fixups[int(k)] = (v, b_f_w.get(str(k), 4), b_f_c.get(str(k), "absolute"), b_f_a.get(str(k), 0),
+                                       "", "unknown", b_sym_a.get(str(k), 0), b_sym_s.get(str(k), 0), b_sym_k.get(str(k), "unknown"))
 
-    matched_100 = sum(1 for r in rows if r["status"] == "match" and r["match_pct"] == 100.0)
-    matched_below = sum(1 for r in rows if r["status"] == "match" and r["match_pct"] < 100.0)
-    summary = {
-        "match": matched_100 + matched_below,
-        "match_100": matched_100,
-        "match_below": matched_below,
-        "thunk": sum(1 for r in rows if r["status"] == "thunk"),
-        "not_found": sum(1 for r in rows if r["status"] == "not_found"),
-    }
+            l_f_w = func_data.get("reloc_widths", {})
+            left_relocs = func_data.get("relocs", {})
+            
+            left_bytes = func_data.get("bytes", "")
+            right_bytes = bytes.fromhex(base_match.get("bytes", "")) if base_match.get("bytes") else b""
+            
+            size = func_data.get("size", len(left_bytes))
+            
+            if kind == "bss":
+                pct = diff_bss_symbol(size, base_match.get("size", 0))
+            else:
+                pct = diff_data_symbol(left_bytes, right_bytes, left_relocs, base_fixups, l_f_w, {int(k): v for k, v in b_f_w.items()})
+                
+            row.update(status=kind, match_pct=pct, count=size, size=size, base_bytes=right_bytes.hex(), offset=func_data.get("offset", 0), base_relocs=base_fixups, obj_relocs=left_relocs, base_reloc_widths={int(k): v for k, v in b_f_w.items()}, obj_reloc_widths=l_f_w)
+            
+        rows.append(row)
+        
+        # Accumulate section stats
+        if row["status"] not in ("thunk", "not_found"):
+            sec = sections_map[sec_name]
+            sec["symbols"].append(row)
+            if row["match_pct"] is not None:
+                sec["generic_weight"] += row["match_pct"] * row["size"]
+                sec["generic_total_size"] += row["size"]
+            if kind in ("data", "bss"):
+                off = row.get("offset", 0)
+                length = row.get("size", 0)
+                if kind == "data" and row.get("base_bytes"):
+                    bd = bytes.fromhex(row["base_bytes"])
+                    if off + len(bd) > len(sec["right_data"]):
+                        sec["right_data"].extend(b"\x00" * (off + len(bd) - len(sec["right_data"])))
+                    sec["right_data"][off:off+len(bd)] = bd
+                for k, v in row.get("base_relocs", {}).items():
+                    sec["right_relocs"][k + off] = v
+                for k, v in row.get("obj_relocs", {}).items():
+                    sec["left_relocs"][k + off] = v
+                for k, v in row.get("base_reloc_widths", {}).items():
+                    sec["right_reloc_widths"][k + off] = v
+                for k, v in row.get("obj_reloc_widths", {}).items():
+                    sec["left_reloc_widths"][k + off] = v
+
+    sections_out = []
+    object_weight = 0.0
+    object_total = 0
+
+    for sec_name, sec in sections_map.items():
+        if not sec["symbols"]: continue
+        generic_match = 100.0 if sec["generic_total_size"] == 0 else sec["generic_weight"] / sec["generic_total_size"]
+        section_match = generic_match
+        
+        if sec["kind"] == "data":
+            left_max = max((r.get("offset", 0) + r.get("size", 0) for r in sec["symbols"]), default=0)
+            left_data = sec["obj_data"][:left_max]
+            right_data = bytes(sec["right_data"])
+            symbols_diffs = [(r["size"], r["match_pct"]) for r in sec["symbols"]]
+            data_score = diff_data_section(left_data, right_data, sec["left_relocs"], sec["right_relocs"], sec["left_reloc_widths"], sec["right_reloc_widths"], symbols_diffs)
+            if data_score > generic_match:
+                section_match = data_score
+        elif sec["kind"] == "bss":
+            symbols_diffs = [(r["size"], r["match_pct"]) for r in sec["symbols"]]
+            left_tuples = []
+            right_tuples = []
+            for r in sec["symbols"]:
+                left_tuples.append((r["offset"], r["size"]))
+                if r["status"] != "not_found":
+                    right_tuples.append((r["offset"], r["size"]))
+            bss_score = diff_bss_section(symbols_diffs, left_tuples, right_tuples)
+            section_match = max(generic_match, bss_score)
+
+        sections_out.append({
+            "name": sec_name,
+            "match_percent": section_match,
+            "size": sec["generic_total_size"],
+            "kind": sec["kind"]
+        })
+        object_weight += section_match * sec["generic_total_size"]
+        object_total += sec["generic_total_size"]
+
+    object_match = 100.0 if object_total == 0 else object_weight / object_total
+
+    matched_100 = sum(1 for r in rows if r["status"] in ("match", "data", "bss") and r["match_pct"] == 100.0)
+    matched_below = sum(1 for r in rows if r["status"] in ("match", "data", "bss") and r["match_pct"] is not None and r["match_pct"] < 100.0)
 
     if json_out:
-        print(json.dumps({"obj": str(obj_path), "connected": True, "summary": summary, "functions": rows}, indent=2))
+        out_data = {
+            "obj": str(obj_path),
+            "connected": True,
+            "summary": {
+                "match": matched_100 + matched_below,
+                "match_100": matched_100,
+                "match_below": matched_below,
+                "thunk": sum(1 for r in rows if r["status"] == "thunk"),
+                "not_found": sum(1 for r in rows if r["status"] == "not_found"),
+            },
+            "object": {
+                "match_percent": object_match,
+                "size": object_total,
+            },
+            "sections": sections_out,
+            "functions": rows
+        }
+        print(json.dumps(out_data, indent=2))
         return 1 if (strict and matched_below) else 0
 
     print("\n" + "=" * 50 + "\nMATCHING RESULTS\n" + "=" * 50)
     for row in rows:
+        dmngld = f" -> {row['demangled_name']}" if row.get("demangled_name") else ""
         if row["status"] == "not_found":
-            print(f"{DIM}[????] {row['name']} (Not found in Live IDA Database){RESET}")
+            print(f"{RED}[????] {row['name']}{dmngld} (Not found in Live IDA Database){RESET}")
         elif row["status"] == "thunk":
-            print(f"{DIM}[THNK] {row['name']} (IDA thunk/forwarder - skipped){RESET}")
-        else:
+            print(f"{DIM}[THNK] {row['name']}{dmngld} (Thunk forwarder in IDA; skipped){RESET}")
+        elif row["match_pct"] is not None:
             pct = row["match_pct"]
-            color = GREEN if pct == 100.0 else (YELLOW if pct >= 80.0 else RED)
-            print(f"{color}[{pct:>6.2f}%]{RESET} {row['name']} ({row['count']} bytes)")
-    print(f"{DIM}{summary}{RESET}")
+            tag = f"[{pct:5.1f}%]"
+            if pct == 100.0:
+                color = GREEN
+            elif pct >= 80.0:
+                color = YELLOW
+            else:
+                color = RED
+            print(f"{color}{tag} {row['name']}{dmngld}{RESET}")
 
+    obj_color = GREEN if object_match == 100.0 else (YELLOW if object_match >= 80.0 else RED)
+    print("=" * 50)
+    print(f"{obj_color}Total Object Match: {object_match:.2f}% ({matched_100}/{len(rows)} matching 100%){RESET}")
     if strict and matched_below:
         print(f"{RED}Strict mode: {matched_below} function(s) below 100% match.{RESET}")
         return 1
     return 0
 
-def match_focus(obj_path: Path, func_name: str) -> None:
-    refresh_ida_cache()
-    obj_funcs = load_obj(obj_path)
+def match_focus(obj_path: Path, func_name: str, parser: str = "auto", reloc_mode=RELOC_MODE_NAME_ADDRESS, mappings_config=None, baseline=None, diff_direction=None) -> None:
+    obj_funcs = load_obj(obj_path, parser=parser)
 
     if func_name not in obj_funcs:
         print(f"Error: Function '{func_name}' not found in {obj_path}")
         sys.exit(1)
 
-    if not server_alive():
-        print(f"{RED}Cannot connect to the live IDA server on 127.0.0.1:28000.{RESET}")
-        print(f"{YELLOW}Ensure ida_server.py is running inside IDA, then retry.{RESET}")
+    if obj_funcs[func_name].get("section_kind", "code") != "code":
+        kind = obj_funcs[func_name].get("section_kind", "code")
+        print(f"Error: '{func_name}' is a {kind} symbol; data diffing is not supported yet.")
         sys.exit(1)
 
     obj_bytes = obj_funcs[func_name]["bytes"]
-    obj_relocs = obj_funcs[func_name]["relocs"]
+    obj_relocs = obj_funcs[func_name].get("relocs", {})
     obj_reloc_widths = obj_funcs[func_name].get("reloc_widths", {})
-    base_match = fetch_from_ida(func_name)
+
+    reloc_mappings = (mappings_config or {}).get("reloc_mappings", {})
+    obj_relocs = _apply_reloc_mappings(obj_relocs, reloc_mappings)
+    
+    right_name = func_name
+    if mappings_config and "mappings" in mappings_config:
+        if func_name in mappings_config["mappings"]:
+            right_name = mappings_config["mappings"][func_name]
+            print(f"Mapped {func_name} -> {right_name}")
+
+    if baseline is not None:
+        baseline_records = _load_baseline(baseline)
+        base_match = baseline_records.get(right_name)
+    else:
+        refresh_ida_cache()
+
+        if not server_alive():
+            print(f"{RED}Cannot connect to the live IDA server on 127.0.0.1:28000.{RESET}")
+            print(f"{YELLOW}Ensure ida_server.py is running inside IDA, then retry.{RESET}")
+            sys.exit(1)
+
+        base_match = fetch_from_ida(right_name)
 
     if not base_match:
-        print(f"{RED}[????] {func_name} (Not found in Live IDA Database){RESET}")
+        print(f"{RED}[????] {right_name} (Not found in Live IDA Database){RESET}")
         sys.exit(1)
 
     if base_match.get("is_thunk"):
         print(f"{DIM}[THNK] {func_name} is an IDA thunk/forwarder; skipping.{RESET}")
         sys.exit(1)
 
-    base_fixups = {int(k): v for k, v in base_match.get("fixups", {}).items()}
+    if is_objdiff_py_enabled():
+        try:
+            from objdiff_py import diff_objects
+            from ida_matcher.matcher.ida_logic import synthetic_obj_from_record
+            left_obj_bytes = Path(obj_path).read_bytes() if Path(obj_path).exists() else None
+            right_obj_bytes = None
+            if baseline is None:
+                right_obj_bytes = fetch_synthetic_obj_from_ida(right_name)
+            if right_obj_bytes is None and base_match:
+                right_obj_bytes = synthetic_obj_from_record(base_match, right_name)
 
-    print(f"\n{'=' * 50}\nDIFF: {func_name}\n{'=' * 50}")
+            if left_obj_bytes and right_obj_bytes:
+                direction = get_diff_direction(mappings_config, override=diff_direction)
+                if direction == "right_to_left":
+                    diff_objects(right_obj_bytes, left_obj_bytes)
+                else:
+                    diff_objects(left_obj_bytes, right_obj_bytes)
+        except Exception:
+            pass
+
+    b_f_w = base_match.get("fixup_widths", {})
+    b_f_c = base_match.get("fixup_classes", {})
+    b_f_a = base_match.get("fixup_addends", {})
+    b_sym_a = base_match.get("fixup_sym_addrs", {})
+    b_sym_s = base_match.get("fixup_sym_sizes", {})
+    b_sym_k = base_match.get("fixup_sym_kinds", {})
+    b_sec_name = base_match.get("section_name", "")
+    b_sec_kind = base_match.get("section_kind", "unknown")
+    base_fixups = {}
+    for k, v in base_match.get("fixups", {}).items():
+        base_fixups[int(k)] = (v, b_f_w.get(k, 4), b_f_c.get(k, "absolute"), b_f_a.get(k, 0),
+                               b_sec_name, b_sec_kind, b_sym_a.get(k, 0), b_sym_s.get(k, 0), b_sym_k.get(k, "unknown"))
+
+    left_demangled_name = obj_funcs[func_name].get("demangled_name")
+    right_demangled_name = base_match.get("demangled_name")
 
     base_switches = base_match.get("switches", {})
     base_switch_ranges = base_match.get("switch_ranges", [])
-    diff_function(obj_bytes, base_match["bytes"], obj_relocs, base_fixups, base_switches, obj_reloc_widths, base_switch_ranges)
+    
+    # Needs left/right accessors for literal matching in focus mode
+    all_base_records = {func_name: base_match}
+    left_accessor = make_left_accessor(obj_funcs)
+    offline = baseline is not None
+    right_accessor = make_right_accessor(all_base_records, offline=offline)
+
+    left_arch = obj_funcs[func_name].get("arch", "x86")
+    right_arch = base_match.get("arch", "x86")
+    arch = "x64" if left_arch == "x64" or right_arch == "x64" else "x86"
+
+    diff_function(obj_bytes, base_match["bytes"], obj_relocs, base_fixups, base_switches, obj_reloc_widths, base_switch_ranges, reloc_mode=reloc_mode, left_accessor=left_accessor, right_accessor=right_accessor, func_name=func_name, left_demangled_name=left_demangled_name, right_demangled_name=right_demangled_name, arch=arch)
 
 def main():
     import argparse
@@ -580,17 +942,29 @@ def main():
     parser.add_argument("--func", help="Target a single function for side-by-side diff (mangled name)")
     parser.add_argument("--json", action="store_true", help="Emit a machine-readable JSON summary (summary mode only)")
     parser.add_argument("--strict", action="store_true", help="Exit 1 when any recognized function is below 100%% (CI gate)")
+    parser.add_argument("--parser", choices=["auto", "lief", "pure"], default="auto",
+                        help="COFF .obj parser backend (auto = LIEF when available)")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors (also honors NO_COLOR env)")
+    parser.add_argument("--reloc-mode", choices=["none", "nameaddress", "datavalue", "all"], default="nameaddress",
+                        help="Relocation comparison mode (default: nameaddress)")
     args = parser.parse_args()
 
     colors = not (args.no_color or os.environ.get("NO_COLOR"))
     _configure_colors(colors)
 
+    reloc_mode_map = {
+        "none": "none",
+        "nameaddress": "name_address",
+        "datavalue": "data_value",
+        "all": "all"
+    }
+    reloc_mode = reloc_mode_map[args.reloc_mode]
+
     if args.func:
-        match_focus(Path(args.obj_path), args.func)
+        match_focus(Path(args.obj_path), args.func, parser=args.parser, reloc_mode=reloc_mode)
         sys.exit(0)
     else:
-        sys.exit(match_summary(Path(args.obj_path), json_out=args.json, strict=args.strict))
+        sys.exit(match_summary(Path(args.obj_path), json_out=args.json, strict=args.strict, parser=args.parser, reloc_mode=reloc_mode))
 
 if __name__ == "__main__":
     main()

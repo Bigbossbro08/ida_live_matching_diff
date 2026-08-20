@@ -1,0 +1,57 @@
+name: CI & Wheel Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies & build
+        run: |
+          pip install maturin pytest capstone lief
+          pip install -e . --no-build-isolation
+      - name: Run tests (default engine)
+        run: python -m pytest ida_matcher/matcher/tests -q
+      - name: Run tests (Rust engine OBJDIFF_PY=1)
+        env:
+          OBJDIFF_PY: "1"
+        run: python -m pytest ida_matcher/matcher/tests -q
+
+  build-wheels:
+    name: Build Wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist

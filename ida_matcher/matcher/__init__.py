@@ -1,1 +1,1 @@
-from ida_matcher.matcher.match_core import match_summary, match_focus, _configure_colors
+from ida_matcher.matcher.match_core import match_summary, match_focus, find_similar_code_symbols, _configure_colors
