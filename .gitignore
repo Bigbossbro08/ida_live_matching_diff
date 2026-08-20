@@ -17,8 +17,4 @@ vendor/objdiff/target/
 
 # Temp / test files
 synth.*
-
-# Ignore all markdown files (planning, tracking) except README
-*.md
-*.MD
-!README.md
+temp/
