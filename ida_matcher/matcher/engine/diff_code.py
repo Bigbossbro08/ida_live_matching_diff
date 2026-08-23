@@ -121,10 +121,19 @@ def _ins_data_literals_eq(ctx, left_ins, right_ins):
 def reloc_eq(ctx, left_ins, right_ins):
     left_reloc = ctx.left.reloc_at(left_ins.address, left_ins.size)
     right_reloc = ctx.right.reloc_at(right_ins.address, right_ins.size)
-    
+
     relax = ctx.reloc_mode == RELOC_MODE_NONE
     if left_reloc is None and right_reloc is None:
         return True
+
+    # `__except_list` is MSVC's pseudo-symbol for the fs:[0] SEH registration
+    # access. IDA cannot emit a matching fixup for a segment-relative access,
+    # so a one-sided reloc here is a recording artifact, not a code difference.
+    l_name_only = left_reloc[1] if left_reloc is not None else ""
+    r_name_only = right_reloc[1] if right_reloc is not None else ""
+    if l_name_only == "__except_list" or r_name_only == "__except_list":
+        return True
+
     if left_reloc is None and right_reloc is not None:
         return relax
     if left_reloc is not None and right_reloc is None:
@@ -142,6 +151,7 @@ def reloc_eq(ctx, left_ins, right_ins):
     right_addend = right_reloc[4] if len(right_reloc) > 4 else 0
     left_sec_name = left_reloc[5] if len(left_reloc) > 5 else ""
     right_sec_name = right_reloc[5] if len(right_reloc) > 5 else ""
+    right_sec_kind = right_reloc[6] if len(right_reloc) > 6 else "unknown"
     left_sym_size = left_reloc[8] if len(left_reloc) > 8 else 0
     right_sym_size = right_reloc[8] if len(right_reloc) > 8 else 0
     left_sym_kind = left_reloc[9] if len(left_reloc) > 9 else "unknown"
@@ -167,12 +177,16 @@ def reloc_eq(ctx, left_ins, right_ins):
     
     if left_sec_name and right_sec_name:
         # The IDA side records the enclosing function's section for every
-        # fixup, while the obj side records each reloc target's own section.
-        # An explicit reloc_mapping (mapped flag) declares the names equivalent,
-        # so the section mismatch is a recording artifact and must be ignored.
+        # fixup (always the function's own code section), while the obj side
+        # records each reloc target's own section. When the IDA-side section
+        # is therefore the enclosing `.text` (sec_kind "code"), a section
+        # disagreement is a recording artifact (e.g. a `.rdata` vtable or
+        # `.xdata$x` FuncInfo reference inside a `.text` function); a matching
+        # target name + addend is already conclusive there.
         mapped_match = (left_mapped or right_mapped) and symbol_name_matches(left_name, right_name)
-        section_name_eq = left_sec_name == right_sec_name or mapped_match
-        
+        artifact = right_sec_kind == "code" or mapped_match
+        section_name_eq = left_sec_name == right_sec_name or artifact
+
         name_ok = False
         if ctx.reloc_mode == RELOC_MODE_DATA_VALUE:
             name_ok = True
@@ -180,7 +194,7 @@ def reloc_eq(ctx, left_ins, right_ins):
             name_ok = True
         elif name_addend_ok or _address_eq(left_reloc, right_reloc):
             name_ok = True
-            
+
         value_ok = False
         if ctx.reloc_mode == RELOC_MODE_NAME_ADDRESS:
             value_ok = True
@@ -190,8 +204,8 @@ def reloc_eq(ctx, left_ins, right_ins):
             value_ok = True
         elif right_sym_size == 0:
             value_ok = True
-            
-        return section_name_eq and name_ok and value_ok
+
+        return (section_name_eq or artifact) and name_ok and value_ok
 
     return name_addend_ok
 

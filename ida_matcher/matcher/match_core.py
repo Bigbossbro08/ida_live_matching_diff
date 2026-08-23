@@ -339,10 +339,18 @@ def compare_for_pairing(left_name, right_name, obj_funcs, all_base_records):
     b_sym_a = right_sym.get("fixup_sym_addrs", {})
     b_sym_s = right_sym.get("fixup_sym_sizes", {})
     b_sym_k = right_sym.get("fixup_sym_kinds", {})
+    b_sec_name = right_sym.get("section_name", "")
+    b_sec_kind = right_sym.get("section_kind", "code")
     base_fixups = {}
     for k, v in right_sym.get("fixups", {}).items():
-        base_fixups[int(k)] = (v, b_f_w.get(str(k), 4), b_f_c.get(str(k), "absolute"), b_f_a.get(str(k), 0),
-                               "", "unknown", b_sym_a.get(str(k), 0), b_sym_s.get(str(k), 0), b_sym_k.get(str(k), "unknown"))
+        # Mirror the tuple shape used by the function-diff path (find_similar /
+        # diff_function): record-level section fields and per-fixup symbol
+        # metadata must be populated, otherwise reloc_eq compares against
+        # placeholder zeros and penalizes valid pairings.
+        base_fixups[int(k)] = (v, b_f_w.get(str(k), 4), b_f_c.get(str(k), "absolute"),
+                               b_f_a.get(str(k), 0), b_sec_name, b_sec_kind,
+                               b_sym_a.get(str(k), 0), b_sym_s.get(str(k), 0),
+                               b_sym_k.get(str(k), "unknown"))
 
     l_f_w = left_sym.get("reloc_widths", {})
     left_relocs = left_sym.get("relocs", {})
@@ -350,7 +358,11 @@ def compare_for_pairing(left_name, right_name, obj_funcs, all_base_records):
     left_bytes = left_sym.get("bytes", b"")
     right_bytes = bytes.fromhex(right_sym.get("bytes", "")) if right_sym.get("bytes") else b""
 
-    pct, _ = diff_data_symbol(left_bytes, right_bytes, left_relocs, base_fixups, l_f_w, {int(k): v for k, v in b_f_w.items()})
+    # diff_data_symbol returns a bare percentage (float); older engine revisions
+    # returned a (pct, detail) tuple - accept both to avoid crashing during
+    # fuzzy pairing of data symbols.
+    result = diff_data_symbol(left_bytes, right_bytes, left_relocs, base_fixups, l_f_w, {int(k): v for k, v in b_f_w.items()})
+    pct = result[0] if isinstance(result, tuple) else result
     return pct
 
 def apply_symbol_mappings(obj_funcs, all_base_records, mappings_config, left_used, right_used, matches):
@@ -500,14 +512,40 @@ def fetch_from_ida(func_name):
 def fetch_many_from_ida(names):
     if not names:
         return {}
-    url = "http://127.0.0.1:28000/funcs?names=" + urllib.parse.quote(",".join(names))
-    try:
-        with urllib.request.urlopen(url, timeout=60) as response:
-            data = json.loads(response.read().decode())
-        results = data.get("results") or {}
-        return {k: v for k, v in results.items() if v is not None}
-    except Exception:
-        return None
+    # Batch in URL-sized chunks: huge name lists overflow the server's HTTP
+    # request line and get silently truncated. Retry any stragglers per-name.
+    results = {}
+    chunk = []
+    chunk_len = 0
+
+    def flush():
+        if not chunk:
+            return
+        url = "http://127.0.0.1:28000/funcs?names=" + urllib.parse.quote(",".join(chunk))
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                data = json.loads(response.read().decode())
+            for k, v in (data.get("results") or {}).items():
+                if v is not None:
+                    results[k] = v
+        except Exception:
+            pass
+        del chunk[:]
+
+    for n in names:
+        enc = len(urllib.parse.quote(n)) + 1
+        if chunk_len + enc > 4000:
+            flush()
+        chunk.append(n)
+        chunk_len += enc
+    flush()
+
+    for n in names:
+        if n not in results:
+            rec = fetch_from_ida(n)
+            if rec is not None:
+                results[n] = rec
+    return results
 
 def fetch_data_from_ida(func_name):
     encoded_name = urllib.parse.quote(func_name)
@@ -642,7 +680,7 @@ def match_summary(obj_path: Path, json_out: bool = False, strict: bool = False, 
                 "right_reloc_widths": {}, "left_reloc_widths": {}
             }
 
-        row = {"name": left_name, "status": None, "match_pct": None, "count": None, "diff_score": None, "section": sec_name, "size": 0}
+        row = {"name": left_name, "status": None, "match_pct": None, "count": None, "diff_score": None, "section": sec_name, "size": 0, "section_kind": kind}
         
         l_demangled = func_data.get("demangled_name")
         base_match = all_base_records.get(right_name) if right_name else None
@@ -701,10 +739,17 @@ def match_summary(obj_path: Path, json_out: bool = False, strict: bool = False, 
             b_sym_a = base_match.get("fixup_sym_addrs", {})
             b_sym_s = base_match.get("fixup_sym_sizes", {})
             b_sym_k = base_match.get("fixup_sym_kinds", {})
+            b_sec_name_d = base_match.get("section_name", "")
+            b_sec_kind_d = base_match.get("section_kind", "unknown")
             base_fixups = {}
             for k, v in base_match.get("fixups", {}).items():
+                # Same tuple shape as the code branch: record-level section
+                # fields and per-fixup symbol metadata are required for
+                # reloc_eq to accept obj-reloc vs concrete-VA references.
+                # (Placeholder zeros here made CRT-initializer-style data
+                # symbols score ~84% despite byte-identical content.)
                 base_fixups[int(k)] = (v, b_f_w.get(str(k), 4), b_f_c.get(str(k), "absolute"), b_f_a.get(str(k), 0),
-                                       "", "unknown", b_sym_a.get(str(k), 0), b_sym_s.get(str(k), 0), b_sym_k.get(str(k), "unknown"))
+                                       b_sec_name_d, b_sec_kind_d, b_sym_a.get(str(k), 0), b_sym_s.get(str(k), 0), b_sym_k.get(str(k), "unknown"))
 
             l_f_w = func_data.get("reloc_widths", {})
             left_relocs = func_data.get("relocs", {})
@@ -798,7 +843,7 @@ def match_summary(obj_path: Path, json_out: bool = False, strict: bool = False, 
                 "match_100": matched_100,
                 "match_below": matched_below,
                 "thunk": sum(1 for r in rows if r["status"] == "thunk"),
-                "not_found": sum(1 for r in rows if r["status"] == "not_found"),
+                "not_found": sum(1 for r in rows if r["status"] == "not_found" and not (r['name'].startswith('__real@') or r['name'].startswith('_$S') or r['name'] == '__fltused')),
             },
             "object": {
                 "match_percent": object_match,
@@ -811,9 +856,21 @@ def match_summary(obj_path: Path, json_out: bool = False, strict: bool = False, 
         return 1 if (strict and matched_below) else 0
 
     print("\n" + "=" * 50 + "\nMATCHING RESULTS\n" + "=" * 50)
+
+    def _is_internal_unmatched(row):
+        """Obj-internal symbols that can never match against the functions-only
+        IDA listing: compiler literals, debug/FPO section symbols, CRT refs,
+        and data/bss symbols (the server serves functions only)."""
+        name = row.get("name", "")
+        if name.startswith("__real@") or name.startswith("_$S") or name == "__fltused":
+            return True
+        return row.get("status") == "not_found" and row.get("section_kind") in ("data", "bss")
+
     for row in rows:
         dmngld = f" -> {row['demangled_name']}" if row.get("demangled_name") else ""
         if row["status"] == "not_found":
+            if _is_internal_unmatched(row):
+                continue
             print(f"{RED}[????] {row['name']}{dmngld} (Not found in Live IDA Database){RESET}")
         elif row["status"] == "thunk":
             print(f"{DIM}[THNK] {row['name']}{dmngld} (Thunk forwarder in IDA; skipped){RESET}")

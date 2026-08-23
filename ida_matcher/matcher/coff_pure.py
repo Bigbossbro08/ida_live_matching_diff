@@ -29,6 +29,15 @@ IMAGE_SYM_CLASS_STATIC = 3
 IMAGE_SYM_CLASS_LABEL = 6
 IMAGE_SYM_TYPE_FUNCTION = 0x20
 
+# IMAGE_COMDAT_SELECTION values (SEC_DEF auxiliary record)
+IMAGE_COMDAT_SELECT_NODUPLICATES = 1
+IMAGE_COMDAT_SELECT_ANY = 2
+IMAGE_COMDAT_SELECT_SAME_SIZE = 3
+IMAGE_COMDAT_SELECT_EXACT_SIZE = 4
+IMAGE_COMDAT_SELECT_ASSOCIATIVE = 5
+IMAGE_COMDAT_SELECT_LARGEST = 6
+IMAGE_COMDAT_SELECT_NEWEST = 7
+
 # IMAGE_REL_I386 relocation types (masking width depends on the type)
 IMAGE_REL_I386_DIR16   = 0x0001
 IMAGE_REL_I386_REL16   = 0x0002
@@ -57,6 +66,89 @@ IMAGE_REL_I386_NAMES = {
 
 def _reloc_width(r_type: int) -> int:
     return IMAGE_REL_I386_WIDTHS.get(r_type, 4)
+
+def _parse_sec_def_aux(aux: bytes):
+    """Parse a SECTION DEFINITION auxiliary record.
+
+    Returns (length, assoc_parent, selection) where assoc_parent is the
+    1-based section number this COMDAT is associative to (0 if not).
+    """
+    if len(aux) < 18:
+        return None
+    length, num_relocs, num_lines, checksum, number, selection, _reserved, high_number = \
+        struct.unpack("<IHHIhBBh", aux)
+    parent = number
+    if parent and high_number:
+        parent += high_number * 65536
+    return (length, parent if selection == IMAGE_COMDAT_SELECT_ASSOCIATIVE else 0, selection)
+
+def _parse_func_def_aux(aux: bytes):
+    """Parse a FUNCTION DEFINITION auxiliary record; returns total_size or None."""
+    if len(aux) < 8:
+        return None
+    length = struct.unpack("<I", aux[:4])[0]
+    return length or None
+
+def scan_coff_aux(data):
+    """Walk the raw COFF symbol table of an unwrapped .obj image.
+
+    Community LIEF builds drop SECTION_DEF/FUNC_DEF auxiliary records for
+    regular symbols, so both parsers use this raw walk instead.
+
+    Returns (assoc_children, funcdef_sizes):
+      assoc_children: {parent_section_number: [child_section_number, ...]}
+          from SECDEF records with IMAGE_COMDAT_SELECT_ASSOCIATIVE (MSVC 6
+          puts each C++ EH funclet/thunk into a `.text$x` COMDAT associated
+          with its parent function's code section).
+      funcdef_sizes: {symbol_name: total_length} from FUNCDEF records.
+    """
+    assoc_children = {}
+    funcdef_sizes = {}
+    try:
+        if len(data) < IMAGE_FILE_HEADER_SIZE:
+            return assoc_children, funcdef_sizes
+        machine, num_sections, _ts, sym_ptr, num_syms, opt_hdr, _chars = \
+            struct.unpack(IMAGE_FILE_HEADER_FMT, data[:IMAGE_FILE_HEADER_SIZE])
+        stroff = sym_ptr + num_syms * IMAGE_SYMBOL_SIZE
+        size_field = data[stroff:stroff + 4]
+        if len(size_field) < 4:
+            return assoc_children, funcdef_sizes
+        strsize = struct.unpack("<I", size_field)[0]
+        strtab = data[stroff + 4:stroff + max(strsize, 4)]
+        i = 0
+        while i < num_syms:
+            off = sym_ptr + i * IMAGE_SYMBOL_SIZE
+            rec = data[off:off + IMAGE_SYMBOL_SIZE]
+            if len(rec) < IMAGE_SYMBOL_SIZE:
+                break
+            name_bytes, val, sec_num, s_type, s_class, num_aux = struct.unpack(IMAGE_SYMBOL_FMT, rec)
+            if name_bytes[:4] == b"\x00\x00\x00\x00":
+                soff = struct.unpack("<I", name_bytes[4:8])[0] - 4
+                if 0 <= soff < len(strtab):
+                    end_idx = strtab.find(b"\x00", soff)
+                    name = strtab[soff:end_idx].decode("latin1") if end_idx != -1 else strtab[soff:].decode("latin1")
+                else:
+                    name = f"unk_str_{soff}"
+            else:
+                name = name_bytes.split(b"\x00", 1)[0].decode("latin1")
+            for k in range(num_aux):
+                aoff = sym_ptr + (i + 1 + k) * IMAGE_SYMBOL_SIZE
+                aux = data[aoff:aoff + IMAGE_SYMBOL_SIZE]
+                if len(aux) < IMAGE_SYMBOL_SIZE:
+                    break
+                if s_class == IMAGE_SYM_CLASS_STATIC and name.startswith("."):
+                    parsed = _parse_sec_def_aux(aux)
+                    if parsed and parsed[1] > 0:
+                        assoc_children.setdefault(parsed[1], []).append(sec_num)
+                        break
+                elif k == 0:
+                    fsize = _parse_func_def_aux(aux)
+                    if fsize and name not in funcdef_sizes:
+                        funcdef_sizes[name] = fsize
+            i += 1 + num_aux
+    except Exception:
+        pass
+    return assoc_children, funcdef_sizes
 
 def parse_string_table(f, offset: int) -> bytes:
     """Read the COFF string table located after the symbol table."""
@@ -173,11 +265,39 @@ def load_obj_pure(obj_path: Path) -> Dict[str, Dict]:
             })
             
             if num_aux > 0:
-                f.seek(num_aux * IMAGE_SYMBOL_SIZE, 1)
                 for _ in range(num_aux):
-                    symbols.append(None)
+                    aux_data = f.read(IMAGE_SYMBOL_SIZE)
+                    symbols.append(aux_data if len(aux_data) == IMAGE_SYMBOL_SIZE else None)
             
             i += 1 + num_aux
+
+        # Auxiliary-derived metadata: COMDAT association (SEC_DEF) and exact
+        # function sizes (FUNC_DEF).
+        assoc_children = {}
+        funcdef_sizes = {}
+        for sym in symbols:
+            if not isinstance(sym, dict) or sym["aux_count"] <= 0:
+                continue
+            aux_list = []
+            j = sym["index"] + 1
+            while j < len(symbols) and len(aux_list) < sym["aux_count"]:
+                if isinstance(symbols[j], (bytes, bytearray)):
+                    aux_list.append(bytes(symbols[j]))
+                else:
+                    break
+                j += 1
+            if sym["class"] == IMAGE_SYM_CLASS_STATIC and sym["name"].startswith("."):
+                for aux in aux_list:
+                    parsed = _parse_sec_def_aux(aux)
+                    if parsed and parsed[1] > 0:
+                        assoc_children.setdefault(parsed[1], []).append(sym["section"])
+                        break
+            else:
+                for aux in aux_list:
+                    fsize = _parse_func_def_aux(aux)
+                    if fsize:
+                        funcdef_sizes[sym["index"]] = fsize
+                        break
 
         # Resolve relocations
         for sec in sections:
@@ -242,6 +362,7 @@ def load_obj_pure(obj_path: Path) -> Dict[str, Dict]:
         for sec_num, syms_in_sec in sec_to_syms.items():
             sec = sections[sec_num - 1]
             syms_in_sec.sort(key=lambda x: x["value"])
+            consumed_children = set()
             
             for idx, sym in enumerate(syms_in_sec):
                 if not (sym["name"].startswith("?") or sym["name"].startswith("_") or sym["name"].startswith("@")):
@@ -252,24 +373,58 @@ def load_obj_pure(obj_path: Path) -> Dict[str, Dict]:
                     continue
                     
                 start = sym["value"]
-                end = sec["raw_size"]
-                for next_sym in syms_in_sec[idx+1:]:
-                    if next_sym["value"] > start:
-                        end = next_sym["value"]
-                        break
-                        
+                exact = funcdef_sizes.get(sym["index"])
+                end = sec["raw_size"] if exact is None else start + exact
+                if exact is None:
+                    for next_sym in syms_in_sec[idx+1:]:
+                        if next_sym["value"] > start:
+                            if next_sym["name"].startswith("__unwind$") or next_sym["name"].startswith("__catch$"):
+                                continue
+                            end = next_sym["value"]
+                            break
+                            
                 size = end - start
                 if size <= 0:
                     continue
                     
-                func_bytes = sec["bytes"][start:start+size]
+                func_bytes = bytearray(sec["bytes"][start:start+size])
                 
                 func_relocs = {}
                 func_reloc_widths = {}
                 for offset, desc in sec["relocs"].items():
-                    if start <= offset < end:
+                    if start <= offset < start + size:
                         func_relocs[offset - start] = desc
                         func_reloc_widths[offset - start] = desc[1]
+
+                # Attach associated EH funclet/thunk COMDATs (e.g. `.text$x`),
+                # matching IDA's tail-chunk windows. Only unambiguous for a
+                # single-function (COMDAT) section.
+                if len(syms_in_sec) == 1 and any(
+                        child_idx not in consumed_children for child_idx in assoc_children.get(sec_num, [])):
+                    # Drop VC6's externalized-funclet NOP padding, matching the
+                    # original binary's chunk split at the next function.
+                    trim = len(func_bytes)
+                    while trim > 0 and func_bytes[trim - 1] == 0x90:
+                        trim -= 1
+                    if trim < len(func_bytes):
+                        del func_bytes[trim:]
+                        size = len(func_bytes)
+                    for child_idx in assoc_children.get(sec_num, []):
+                        if child_idx in consumed_children or child_idx == sec_num:
+                            continue
+                        child_sec = sections[child_idx - 1]
+                        if not (child_sec["flags"] & 0x00000020):
+                            continue
+                        child_content = child_sec["bytes"]
+                        if not child_content:
+                            continue
+                        append_at = len(func_bytes)
+                        func_bytes.extend(child_content)
+                        for offset, desc in child_sec["relocs"].items():
+                            func_relocs[append_at + offset] = desc
+                            func_reloc_widths[append_at + offset] = desc[1]
+                        consumed_children.add(child_idx)
+                    size = len(func_bytes)
 
                 if sym["name"] in funcs_out:
                     continue

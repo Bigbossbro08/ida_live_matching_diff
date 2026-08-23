@@ -166,10 +166,14 @@ def _get_func_relocs_via_operands(func, chunks):
     # targets can be excluded: a real COFF .obj never emits relocs for branches
     # that stay inside the function.
     if chunks:
-        func_lo = min(c[0] for c in chunks)
-        func_hi = max(c[0] + c[2] for c in chunks)
+        # Membership must be tested per chunk: a bounding box over distant
+        # tail chunks (e.g. `.text$x` EH funclets far from the body) would
+        # swallow unrelated externals located between them.
+        def _in_func_chunks(addr):
+            return any(c[0] <= addr < c[0] + c[2] for c in chunks)
     else:
-        func_lo = func_hi = 0
+        def _in_func_chunks(addr):
+            return False
 
     for chunk_start, chunk_buf_offset, chunk_size in chunks:
         chunk_end = chunk_start + chunk_size
@@ -218,7 +222,7 @@ def _get_func_relocs_via_operands(func, chunks):
                 target_addr = imm_val if op.type == ida_ua.o_imm else op.addr
 
                 # Exclude intra-function branch targets (no reloc in the .obj).
-                if op.type in (ida_ua.o_near, ida_ua.o_far) and func_lo <= target_addr < func_hi:
+                if op.type in (ida_ua.o_near, ida_ua.o_far) and _in_func_chunks(target_addr):
                     continue
 
                 # Resolve the target to its (possibly containing) named symbol.

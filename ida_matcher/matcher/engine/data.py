@@ -58,7 +58,22 @@ def diff_data_symbol(left_data, right_data, left_relocs, right_relocs, left_relo
     right_src = _InsnSource(right_data, right_relocs, right_reloc_widths)
     ctx = _DiffContext(left_src, right_src, reloc_mode)
 
-    bytes_match_ratio = diff_data_range(left_data, right_data)
+    left_masked = bytearray(left_data)
+    right_masked = bytearray(right_data)
+    
+    for l_off in left_relocs:
+        if l_off in right_relocs:
+            l_sz = left_reloc_widths.get(l_off, 4)
+            for i in range(l_sz):
+                if l_off + i < len(left_masked):
+                    left_masked[l_off + i] = 0
+            
+            r_sz = right_reloc_widths.get(l_off, 4)
+            for i in range(r_sz):
+                if l_off + i < len(right_masked):
+                    right_masked[l_off + i] = 0
+
+    bytes_match_ratio = diff_data_range(bytes(left_masked), bytes(right_masked))
 
     reloc_diffs = diff_data_relocs_for_range(left_relocs, right_relocs, left_reloc_widths, right_reloc_widths, ctx)
 

@@ -50,3 +50,26 @@ def test_diff_data_section():
     
     sec_pct = diff_data_section(left_data, right_data, relocs, relocs, widths, widths, symbols_diffs)
     assert sec_pct == 100.0
+
+
+def test_diff_data_symbol_returns_scalar_pct():
+    # compare_for_pairing (match_core) accepts either a bare float or a legacy
+    # (pct, detail) tuple; the engine returns a bare float since the
+    # name/address reloc-mode rewrite. Guard against a crash on unpack.
+    from ida_matcher.matcher.engine.data import diff_data_symbol as dds
+
+    result = dds(b"\x00" * 8, b"\x00" * 8, {}, {}, {}, {})
+    assert isinstance(result, float)
+    assert result == 100.0
+
+
+def test_compare_for_pairing_with_data_symbols(monkeypatch):
+    # Regression: fuzzy pairing of a data symbol used to do `pct, _ = diff_data_symbol(...)`
+    # and crash with TypeError: cannot unpack non-iterable float object.
+    import ida_matcher.matcher.match_core as mc
+
+    left = {"?temp@@3VBVector@@A": {"bytes": b"\x00" * 12, "relocs": {}, "reloc_widths": {}}}
+    right = {"?temp@@3VBVector@@A": {"bytes": "00" * 12, "section_kind": "data",
+                                     "fixups": {}, "fixup_widths": {}}}
+    pct = mc.compare_for_pairing("?temp@@3VBVector@@A", "?temp@@3VBVector@@A", left, right)
+    assert pct == 100.0

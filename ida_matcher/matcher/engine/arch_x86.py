@@ -147,7 +147,11 @@ def _reloc_in_mem_disp(ins_ref, reloc):
     size = ins_ref.size
     span_start = max(0, size - min(4, size))
     rel = reloc[0] - ins_ref.address
-    return span_start <= rel < size
+    if span_start <= rel < size:
+        return True
+    # C7-style "mov r/m32, imm32" forms: opcode+ModRM, disp32, then imm32 -
+    # the displacement is NOT the trailing 4 bytes but sits at size-8.
+    return size >= 8 and rel == size - 8
 
 def _mem_args(insn, mem_op, ins_ref, reloc, reloc_on_disp):
     args = []
@@ -233,10 +237,12 @@ def process_instruction(source, ins_ref):
                             args.append(("signed", op.imm))
             elif op.type == capstone.x86.X86_OP_MEM:
                 is_rip = op.mem.base == capstone.x86.X86_REG_RIP
+                # Note: `has_imm` is deliberately not a gate here - C7-style
+                # "mov r/m32, imm32" carries both a disp32 (relocated) and an
+                # imm32; the span check in _reloc_in_mem_disp disambiguates.
                 reloc_on_disp = (
                     reloc is not None
                     and not relocation_emitted
-                    and not has_imm
                     and (is_rip or _reloc_in_mem_disp(ins_ref, reloc))
                 )
                 args.extend(_mem_args(insn, op, ins_ref, reloc, reloc_on_disp))

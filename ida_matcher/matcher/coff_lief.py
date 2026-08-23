@@ -206,6 +206,52 @@ def _extract_symbol_flags(sym) -> set:
     return flags
 
 
+def _collect_associative_children(coff) -> Dict[int, list]:
+    """Deprecated: kept for compatibility; superseded by coff_pure.scan_coff_aux."""
+    return {}
+
+
+def _resolve_section_relocs(sec, section_by_idx) -> dict:
+    """Resolve one section's relocations (same record shape as load loop)."""
+    sec_relocs = {}
+    content = None
+    for reloc in sec.relocations:
+        width = _reloc_width(_reloc_type_value(reloc))
+        r_type = _TYPE_NAME_BY_VALUE.get(int(_reloc_type_value(reloc)))
+        r_class = f"IMAGE_REL_{r_type}" if r_type else "unknown"
+
+        t_name = f"unk_sym_{reloc.symbol_idx}"
+        t_sec_name = ""
+        t_sec_kind = "unknown"
+        sym_addr = 0
+        sym_size = 0
+        sym_kind = "unknown"
+        addend = 0
+
+        if reloc.symbol is not None:
+            t_name = reloc.symbol.name
+            sym_addr = int(reloc.symbol.value)
+            sym_size = _exact_size(reloc.symbol) or 0
+            t_sec = section_by_idx.get(reloc.symbol.section_idx)
+            if t_sec:
+                t_sec_name = t_sec.name
+                t_sec_kind = _section_kind(t_sec)
+                sym_kind = "code" if t_sec_kind == "code" else "data"
+                if width > 0:
+                    try:
+                        if content is None:
+                            content = bytes(sec.content)
+                        b = content[reloc.address : reloc.address + width]
+                        if len(b) == width:
+                            addend = int.from_bytes(b, "little")
+                    except Exception:
+                        pass
+
+        sec_relocs[reloc.address] = (t_name, width, r_class, addend, t_sec_name, t_sec_kind,
+                                     sym_addr, sym_size, sym_kind)
+    return sec_relocs
+
+
 def load_obj_lief(obj_path) -> Dict[str, Dict]:
     """
     Parse a COFF .obj file with LIEF and extract function/data boundaries and
@@ -242,6 +288,12 @@ def load_obj_lief(obj_path) -> Dict[str, Dict]:
 
     section_by_idx = {i + 1: sec for i, sec in enumerate(coff.sections)}
 
+    # Community LIEF drops SECTION_DEF/FUNC_DEF auxiliary records, so walk the
+    # raw COFF symbol table for COMDAT associations and exact function sizes.
+    from .coff_pure import scan_coff_aux
+    assoc_children, funcdef_sizes = scan_coff_aux(raw)
+    consumed_children = set()
+
     funcs_out = {}
     for sec_idx, sec in section_by_idx.items():
         kind = _section_kind(sec)
@@ -264,39 +316,7 @@ def load_obj_lief(obj_path) -> Dict[str, Dict]:
             else:
                 unit_end = content_len
 
-        sec_relocs = {}
-        for reloc in sec.relocations:
-            width = _reloc_width(_reloc_type_value(reloc))
-            r_type = _TYPE_NAME_BY_VALUE.get(int(_reloc_type_value(reloc)))
-            r_class = f"IMAGE_REL_{r_type}" if r_type else "unknown"
-            
-            t_name = f"unk_sym_{reloc.symbol_idx}"
-            t_sec_name = ""
-            t_sec_kind = "unknown"
-            sym_addr = 0
-            sym_size = 0
-            sym_kind = "unknown"
-            addend = 0
-            
-            if reloc.symbol is not None:
-                t_name = reloc.symbol.name
-                sym_addr = int(reloc.symbol.value)
-                sym_size = _exact_size(reloc.symbol) or 0
-                t_sec = section_by_idx.get(reloc.symbol.section_idx)
-                if t_sec:
-                    t_sec_name = t_sec.name
-                    t_sec_kind = _section_kind(t_sec)
-                    sym_kind = "code" if t_sec_kind == "code" else "data"
-                    if width > 0:
-                        try:
-                            b = bytes(sec.content)[reloc.address : reloc.address + width]
-                            if len(b) == width:
-                                addend = int.from_bytes(b, "little")
-                        except Exception:
-                            pass
-
-            sec_relocs[reloc.address] = (t_name, width, r_class, addend, t_sec_name, t_sec_kind,
-                                         sym_addr, sym_size, sym_kind)
+        sec_relocs = _resolve_section_relocs(sec, section_by_idx)
 
         for idx, sym in enumerate(syms):
             if sym.name in funcs_out:
@@ -304,7 +324,11 @@ def load_obj_lief(obj_path) -> Dict[str, Dict]:
 
             start = sym.value
             size = _exact_size(sym)
+            if size is None:
+                size = funcdef_sizes.get(sym.name)
             flags = _extract_symbol_flags(sym)
+            if _exact_size(sym) is None and funcdef_sizes.get(sym.name) is None:
+                flags.add("SizeInferred")
             if size is None:
                 size = unit_end - start if unit_end is not None else None
                 for nxt in syms[idx + 1:]:
@@ -314,8 +338,6 @@ def load_obj_lief(obj_path) -> Dict[str, Dict]:
                         gap = nxt.value - start
                         size = gap if size is None else min(size, gap)
                         break
-            if _exact_size(sym) is None and size is not None and size > 0:
-                flags.add("SizeInferred")
 
             if size is None or size <= 0:
                 continue
@@ -329,7 +351,7 @@ def load_obj_lief(obj_path) -> Dict[str, Dict]:
                 size = min(size, max(0, content_len - start))
                 if size <= 0:
                     continue
-                func_bytes = content[start:start + size]
+                func_bytes = bytearray(content[start:start + size])
 
             func_relocs = {}
             func_reloc_widths = {}
@@ -337,6 +359,40 @@ def load_obj_lief(obj_path) -> Dict[str, Dict]:
                 if start <= rel_off < start + size:
                     func_relocs[rel_off - start] = desc
                     func_reloc_widths[rel_off - start] = desc[1]
+
+            # Attach associated EH funclet/thunk sections (e.g. `.text$x`) so
+            # the local window matches IDA functions carrying those bytes as
+            # tail chunks. Only safe when the parent section is a single-
+            # function COMDAT (VC6 /Gy), otherwise attribution is ambiguous.
+            if kind == "code" and len(syms) == 1 and any(
+                    child_idx not in consumed_children for child_idx in assoc_children.get(sec_idx, [])):
+                # VC6 pads the body COMDAT with NOPs when the funclet is
+                # externalized; the original binary splits the chunk at the
+                # next function, so drop that tail padding before appending.
+                trim = len(func_bytes)
+                while trim > 0 and func_bytes[trim - 1] == 0x90:
+                    trim -= 1
+                if trim < len(func_bytes):
+                    del func_bytes[trim:]
+                    size = len(func_bytes)
+                for child_idx in assoc_children.get(sec_idx, []):
+                    if child_idx in consumed_children or child_idx == sec_idx:
+                        continue
+                    child_sec = section_by_idx.get(child_idx)
+                    if child_sec is None or _section_kind(child_sec) != "code":
+                        continue
+                    child_content = bytes(child_sec.content)
+                    if not child_content:
+                        continue
+                    append_at = len(func_bytes)
+                    func_bytes.extend(child_content)
+                    for rel_off, desc in _resolve_section_relocs(child_sec, section_by_idx).items():
+                        func_relocs[append_at + rel_off] = desc
+                        func_reloc_widths[append_at + rel_off] = desc[1]
+                    consumed_children.add(child_idx)
+                size = len(func_bytes)
+            if kind != "bss":
+                size = len(func_bytes)
 
             record = {
                 "bytes": bytearray(func_bytes),

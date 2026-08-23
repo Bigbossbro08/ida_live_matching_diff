@@ -729,3 +729,35 @@ def test_match_summary_demangled_name_json(tmp_path, capsys):
     funcs = {r["name"]: r for r in data["functions"]}
     assert "_fa" in funcs
     assert funcs["_fa"]["demangled_name"] == "fa_demangled(int)"
+
+def test_c7_mov_disp32_imm32_reloc_classified():
+    # Regression: C7-style "mov dword ptr [disp32], imm32" carries its disp at
+    # size-8 (not the trailing 4 bytes). The reloc was previously not matched
+    # to the mem-disp operand, so link-time-zero obj bytes clashed with the
+    # base binary's concrete VAs and CRT-initializer-style code scored ~84%.
+    from ida_matcher.matcher.engine.diff_code import diff_code
+
+    obj_bytes = bytes.fromhex(
+        "c705" "00000000" "00000000"
+        "c705" "04000000" "00000000"
+        "c705" "08000000" "00000000"
+        "c3"
+    )
+    base_bytes = bytes.fromhex(
+        "c705" "d83c6800" "00000000"
+        "c705" "dc3c6800" "00000000"
+        "c705" "e03c6800" "00000000"
+        "c3"
+    )
+    obj_relocs = {
+        2: ("?temp@@3VBVector@@A", 4, "IMAGE_REL_I386_DIR32", 0, "/537", "bss", 0, 0, "data", True),
+        12: ("?temp@@3VBVector@@A", 4, "IMAGE_REL_I386_DIR32", 4, "/537", "bss", 0, 0, "data", True),
+        22: ("?temp@@3VBVector@@A", 4, "IMAGE_REL_I386_DIR32", 8, "/537", "bss", 0, 0, "data", True),
+    }
+    base_fixups = {
+        2: ("?temp@@3VBVector@@A", 4, "absolute", 0, ".text", "code", 101592, 0, "data"),
+        12: ("?temp@@3VBVector@@A", 4, "absolute", 4, ".text", "code", 101592, 0, "data"),
+        22: ("?temp@@3VBVector@@A", 4, "absolute", 8, ".text", "code", 101592, 0, "data"),
+    }
+    res = diff_code(obj_bytes, obj_relocs, {2: 4, 12: 4, 22: 4}, base_bytes, base_fixups, {2: 4, 12: 4, 22: 4})
+    assert res["match_percent"] == 100.0
