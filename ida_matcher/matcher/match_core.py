@@ -658,6 +658,18 @@ def match_summary(obj_path: Path, json_out: bool = False, strict: bool = False, 
         all_base_records = dict(records)
         all_base_records.update(data_records)
 
+        # Pull IDA-side records for manually mapped right-hand names too, so
+        # apply_symbol_mappings can pair obj symbols to differently-named IDA symbols.
+        extra_right = []
+        if mappings_config:
+            mappings = mappings_config.get("mappings") or {}
+            extra_right = [r for r in mappings.values()
+                           if r not in all_base_records and r not in code_syms and r not in data_syms]
+        if extra_right:
+            extra_records = fetch_many_from_ida(extra_right) or \
+                {n: rec for n in extra_right if (rec := fetch_from_ida(n)) is not None}
+            all_base_records.update(extra_records)
+
         left_accessor = make_left_accessor(obj_funcs)
         right_accessor = make_right_accessor(all_base_records)
 
