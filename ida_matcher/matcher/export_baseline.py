@@ -19,13 +19,20 @@ import sys
 import argparse
 import urllib.request
 
+from ida_matcher.matcher import transport
 
-def export_baseline(output_path, host="127.0.0.1", port=28000):
-    """GET /baseline from the IDA server and write the snapshot to *output_path*.
 
-    Returns the number of records written, or raises on failure.
+def export_baseline(output_path, host=None, port=None):
+    """GET /baseline from the live connector and write the snapshot to *output_path*.
+
+    Endpoint resolution: explicit ``host``/``port`` -> ``transport`` (ida-cli
+    discovery, then legacy ``:28000``). Returns the number of records written.
     """
-    url = f"http://{host}:{port}/baseline"
+    if host is not None or port is not None:
+        base = f"http://{host or '127.0.0.1'}:{port or 28000}"
+    else:
+        base = transport.base_url()
+    url = base + "/baseline"
     with urllib.request.urlopen(url, timeout=120) as response:
         raw = response.read()
     records = json.loads(raw.decode("utf-8"))
@@ -43,10 +50,12 @@ def main():
         "--out", default="baseline.json", help="Output JSON path (default: baseline.json)"
     )
     parser.add_argument(
-        "--host", default="127.0.0.1", help="IDA server host (default: 127.0.0.1)"
+        "--host", default=None,
+        help="Override host (default: auto-discover ida-cli, else 127.0.0.1)"
     )
     parser.add_argument(
-        "--port", type=int, default=28000, help="IDA server port (default: 28000)"
+        "--port", type=int, default=None,
+        help="Override port (default: auto-discover ida-cli, else 28000)"
     )
     args = parser.parse_args()
 

@@ -18,6 +18,7 @@ try:
 except ImportError:
     pass
 
+from ida_matcher.matcher import transport
 from ida_matcher.matcher.coff_parser import load_obj
 from ida_matcher.matcher.engine.types import (
     DEFAULT_RELOC_WIDTH, RELOC_MODE_NAME_ADDRESS, RELOC_MODE_NONE, RELOC_MODE_DATA_VALUE, RELOC_MODE_ALL,
@@ -32,8 +33,6 @@ from ida_matcher.matcher.engine.display import (
 from ida_matcher.matcher.engine.data import (
     diff_data_symbol, diff_bss_symbol, diff_data_section, diff_bss_section
 )
-
-IDA_SERVER_URL = "http://127.0.0.1:28000/func?name="
 
 def _disassemble(raw_bytes, base_offset=0):
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
@@ -130,7 +129,7 @@ def _apply_reloc_mappings(obj_relocs, reloc_mappings):
 def fetch_synthetic_obj_from_ida(func_name: str) -> bytes | None:
     """Fetch raw synthetic COFF .obj bytes for a symbol from IDA server."""
     encoded_name = urllib.parse.quote(func_name)
-    url = f"http://127.0.0.1:28000/synthetic_obj?name={encoded_name}"
+    url = transport.url(f"/synthetic_obj?name={encoded_name}")
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             if response.status == 200:
@@ -436,8 +435,8 @@ def find_similar_code_symbols(obj_path: Path, source_name: str, parser: str = "a
 
     if not server_alive():
         print(
-            f"{RED}Cannot connect to the live IDA server on 127.0.0.1:28000.{RESET}\n"
-            f"{YELLOW}Ensure ida_server.py is running inside IDA, then retry.{RESET}"
+            f"{RED}Cannot connect to the live IDA connector at {transport.base_url()}.{RESET}\n"
+            f"{YELLOW}Start ida-cli inside IDA (or legacy ida_server.py), then retry.{RESET}"
         )
         return 0
 
@@ -489,7 +488,7 @@ def find_similar_code_symbols(obj_path: Path, source_name: str, parser: str = "a
     return 0
 
 def fetch_all_names_from_ida():
-    url = "http://127.0.0.1:28000/all_names"
+    url = transport.url("/all_names")
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             data = json.loads(response.read().decode())
@@ -499,7 +498,7 @@ def fetch_all_names_from_ida():
 
 def fetch_from_ida(func_name):
     encoded_name = urllib.parse.quote(func_name)
-    url = IDA_SERVER_URL + encoded_name
+    url = transport.url("/func?name=" + encoded_name)
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             data = json.loads(response.read().decode())
@@ -521,7 +520,7 @@ def fetch_many_from_ida(names):
     def flush():
         if not chunk:
             return
-        url = "http://127.0.0.1:28000/funcs?names=" + urllib.parse.quote(",".join(chunk))
+        url = transport.url("/funcs?names=" + urllib.parse.quote(",".join(chunk)))
         try:
             with urllib.request.urlopen(url, timeout=60) as response:
                 data = json.loads(response.read().decode())
@@ -549,7 +548,7 @@ def fetch_many_from_ida(names):
 
 def fetch_data_from_ida(func_name):
     encoded_name = urllib.parse.quote(func_name)
-    url = "http://127.0.0.1:28000/data?name=" + encoded_name
+    url = transport.url("/data?name=" + encoded_name)
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             data = json.loads(response.read().decode())
@@ -562,14 +561,40 @@ def fetch_data_from_ida(func_name):
 def fetch_many_data_from_ida(names):
     if not names:
         return {}
-    url = "http://127.0.0.1:28000/datas?names=" + urllib.parse.quote(",".join(names))
-    try:
-        with urllib.request.urlopen(url, timeout=60) as response:
-            data = json.loads(response.read().decode())
-        results = data.get("results") or {}
-        return {k: v for k, v in results.items() if v is not None}
-    except Exception:
-        return None
+    # Chunk like /funcs: one huge /datas URL exceeds the server's single-read
+    # request-line buffer. Retry any stragglers per-name.
+    results = {}
+    chunk = []
+    chunk_len = 0
+
+    def flush():
+        if not chunk:
+            return
+        url = transport.url("/datas?names=" + urllib.parse.quote(",".join(chunk)))
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                data = json.loads(response.read().decode())
+            for k, v in (data.get("results") or {}).items():
+                if v is not None:
+                    results[k] = v
+        except Exception:
+            pass
+        del chunk[:]
+
+    for n in names:
+        enc = len(urllib.parse.quote(n)) + 1
+        if chunk_len + enc > 4000:
+            flush()
+        chunk.append(n)
+        chunk_len += enc
+    flush()
+
+    for n in names:
+        if n not in results:
+            rec = fetch_data_from_ida(n)
+            if rec is not None:
+                results[n] = rec
+    return results
 
 def make_left_accessor(obj_funcs):
     def accessor(sym_name):
@@ -603,7 +628,7 @@ def _load_baseline(baseline):
 def server_alive():
     """True when the live IDA server responds to GET /health."""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:28000/health", timeout=3) as response:
+        with urllib.request.urlopen(transport.url("/health"), timeout=3) as response:
             return response.status == 200
     except Exception:
         return False
@@ -611,7 +636,7 @@ def server_alive():
 def refresh_ida_cache():
     """Ask the live IDA server to rebuild its name->address cache."""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:28000/refresh", timeout=10) as response:
+        with urllib.request.urlopen(transport.url("/refresh"), timeout=10) as response:
             response.read()
     except Exception:
         pass
@@ -640,8 +665,8 @@ def match_summary(obj_path: Path, json_out: bool = False, strict: bool = False, 
 
         if not server_alive():
             msg = (
-                f"{RED}Cannot connect to the live IDA server on 127.0.0.1:28000.{RESET}\n"
-                f"{YELLOW}Ensure ida_server.py is running inside IDA, then retry.{RESET}"
+                f"{RED}Cannot connect to the live IDA connector at {transport.base_url()}.{RESET}\n"
+                f"{YELLOW}Start ida-cli inside IDA (or legacy ida_server.py), then retry.{RESET}"
             )
             if json_out:
                 print(json.dumps({"obj": str(obj_path), "connected": False}))
@@ -937,8 +962,8 @@ def match_focus(obj_path: Path, func_name: str, parser: str = "auto", reloc_mode
         refresh_ida_cache()
 
         if not server_alive():
-            print(f"{RED}Cannot connect to the live IDA server on 127.0.0.1:28000.{RESET}")
-            print(f"{YELLOW}Ensure ida_server.py is running inside IDA, then retry.{RESET}")
+            print(f"{RED}Cannot connect to the live IDA connector at {transport.base_url()}.{RESET}")
+            print(f"{YELLOW}Start ida-cli inside IDA (or legacy ida_server.py), then retry.{RESET}")
             sys.exit(1)
 
         base_match = fetch_from_ida(right_name)

@@ -650,15 +650,18 @@ def test_export_baseline_writes_snapshot(tmp_path, monkeypatch):
             return self._d
     
     test_json = {"func1": {"bytes": "c3"}}
+    seen = {}
     def fake_open(url, timeout=120):
-        assert url == "http://127.0.0.1:28000/baseline"
+        seen["url"] = url
         return FakeResp(json.dumps(test_json).encode("utf-8"))
         
     monkeypatch.setattr(eb.urllib.request, "urlopen", fake_open)
     
     out_file = tmp_path / "baseline.json"
-    count = eb.export_baseline(out_file)
+    # Explicit host/port still honoured (back-compat), and discovery-based by default.
+    count = eb.export_baseline(out_file, host="127.0.0.1", port=28000)
     assert count == 1
+    assert seen["url"] == "http://127.0.0.1:28000/baseline"
     
     written = json.loads(out_file.read_text())
     assert written == test_json

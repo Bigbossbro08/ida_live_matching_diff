@@ -8,6 +8,10 @@ import traceback
 import threading
 from urllib.parse import urlparse, parse_qs
 
+# DEPRECATED: the ida-cli connector now serves the same API on 28100+ (ports
+# discovered via ~/.ida-cli/instances). This standalone server is retained only
+# as a fallback; the client prefers ida-cli (see ida_matcher/matcher/transport.py)
+# and only falls back to 127.0.0.1:28000 when no ida-cli instance is reachable.
 PORT = 28000
 SERVER_SOCKET = None
 
@@ -212,6 +216,9 @@ def start_server():
         if LOGIC_MODULE:
             LOGIC_MODULE.build_cache()
         print(f"IDA Live Matcher Server running on port {PORT} (Threaded, Hot-Reload Enabled)...")
+        print("[DEPRECATED] The ida-cli connector supersedes this server. "
+              "Prefer running ida-cli inside IDA (routes /func,/funcs,/data,/datas,"
+              "/all_names,/baseline,/refresh,/synthetic_obj are compatible).")
         
         threading.Thread(target=accept_loop, daemon=True).start()
     except Exception as e:
